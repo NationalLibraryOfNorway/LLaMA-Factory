@@ -867,6 +867,34 @@ register_model_group(
 
 register_model_group(
     models={
+        "Gemma-4-26B-A4B-Thinking": {
+            DownloadSource.DEFAULT: "google/gemma-4-26B-A4B-it",
+        },
+        "Gemma-4-31B-Thinking": {
+            DownloadSource.DEFAULT: "google/gemma-4-31B-it",
+        },
+    },
+    template="gemma4",
+    multimodal=True,
+)
+
+
+register_model_group(
+    models={
+        "Gemma-4-E2B-Thinking": {
+            DownloadSource.DEFAULT: "google/gemma-4-E2B-it",
+        },
+        "Gemma-4-E4B-Thinking": {
+            DownloadSource.DEFAULT: "google/gemma-4-E4B-it",
+        },
+    },
+    template="gemma4n",
+    multimodal=True,
+)
+
+
+register_model_group(
+    models={
         "GLM-4-9B": {
             DownloadSource.DEFAULT: "zai-org/glm-4-9b",
             DownloadSource.MODELSCOPE: "ZhipuAI/glm-4-9b",
