@@ -451,6 +451,14 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
 
         features.update(mm_inputs)
 
+        # Gemma 4 requires token_type_ids and mm_token_type_ids tensors even for text-only training.
+        # The multimodal plugin only creates these for multimodal inputs, so inject zeros here.
+        if model_type in ("gemma4", "gemma4n"):
+            if "token_type_ids" not in features:
+                features["token_type_ids"] = torch.zeros_like(features["input_ids"])
+            if "mm_token_type_ids" not in features:
+                features["mm_token_type_ids"] = torch.zeros_like(features["input_ids"])
+
         if "image_bound" in features:  # for minicpmv inputs
             bsz, seq_length = features["input_ids"].shape
             features["position_ids"] = torch.arange(seq_length).long().repeat(bsz, 1)
