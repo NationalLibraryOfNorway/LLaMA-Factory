@@ -199,17 +199,17 @@ class MMPluginMixin:
             num_video_tokens += message["content"].count(VIDEO_PLACEHOLDER)
             num_audio_tokens += message["content"].count(AUDIO_PLACEHOLDER)
 
-        if len(images) != num_image_tokens:
+        if len(images) > 0 and len(images) != num_image_tokens:
             raise ValueError(
                 f"The number of images does not match the number of {IMAGE_PLACEHOLDER} tokens in {messages}."
             )
 
-        if len(videos) != num_video_tokens:
+        if len(videos) > 0 and len(videos) != num_video_tokens:
             raise ValueError(
                 f"The number of videos does not match the number of {VIDEO_PLACEHOLDER} tokens in {messages}."
             )
 
-        if len(audios) != num_audio_tokens:
+        if len(audios) > 0 and len(audios) != num_audio_tokens:
             raise ValueError(
                 f"The number of audios does not match the number of {AUDIO_PLACEHOLDER} tokens in {messages}."
             )
@@ -530,7 +530,7 @@ class Gemma3Plugin(BasePlugin):
         num_image_tokens = 0
         messages = deepcopy(messages)
         boi_token: str = getattr(processor, "boi_token")
-        full_image_sequence: str = getattr(processor, "full_image_sequence")
+        full_image_sequence: str = getattr(processor, "full_image_sequence", "")
         image_str = full_image_sequence if self.expand_mm_tokens else boi_token
 
         do_pan_and_scan: bool = getattr(processor, "image_do_pan_and_scan", False)
@@ -589,7 +589,7 @@ class Gemma3nPlugin(Gemma3Plugin):
         messages = deepcopy(messages)
         boi_token: str = getattr(processor, "boi_token")
         boa_token: str = getattr(processor, "boa_token")
-        full_image_sequence: str = getattr(processor, "full_image_sequence")
+        full_image_sequence: str = getattr(processor, "full_image_sequence", "")
         full_audio_sequence: str = getattr(processor, "full_audio_sequence")
         image_str = full_image_sequence if self.expand_mm_tokens else boi_token
         audio_str = full_audio_sequence if self.expand_mm_tokens else boa_token
