@@ -136,7 +136,10 @@ def autocast_projector_dtype(model: "PreTrainedModel", model_args: "ModelArgumen
     if getattr(model, "quantization_method", None):
         model_type = getattr(model.config, "model_type", None)
         if model_type in COMPOSITE_MODELS:
-            mm_projector = COMPOSITE_MODELS[model_type].get_projector(model)
+            try:
+                mm_projector = COMPOSITE_MODELS[model_type].get_projector(model)
+            except AttributeError:
+                return
         else:
             return
 
@@ -220,7 +223,7 @@ _register_composite_model(
 
 
 _register_composite_model(
-    model_type="gemma4",
+    model_type="gemma4_DISABLED",
     vision_model_keys=["vision_tower", "audio_tower"],
     lora_conflict_keys=["per_layer_projection_norm"],
 )
