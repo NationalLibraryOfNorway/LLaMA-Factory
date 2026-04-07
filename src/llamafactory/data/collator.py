@@ -494,7 +494,7 @@ class SFTDataCollatorWith4DAttentionMask(MultiModalDataCollatorForSeq2Seq):
         if non_padding_indices.numel() == seq_len:
             return
 
-        keys_on_seq_dim_1 = {"input_ids", "labels", "attention_mask", "token_type_ids"}
+        keys_on_seq_dim_1 = {"input_ids", "labels", "attention_mask", "token_type_ids", "mm_token_type_ids"}
         for key, value in list(features.items()):
             if not torch.is_tensor(value):
                 continue

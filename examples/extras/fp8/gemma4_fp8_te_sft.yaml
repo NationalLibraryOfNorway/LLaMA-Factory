@@ -1,0 +1,40 @@
+# Gemma 4 FP8 SFT with Transformer Engine backend
+# Optimal for Hopper GPUs (GH200 on Olivia)
+# Uses pruned 2-layer model for smoke testing FP8 training
+
+### Model configuration
+model_name_or_path: marksverdhei/gemma-4-31B-2L-test
+trust_remote_code: true
+
+### Method configuration
+stage: sft
+do_train: true
+finetuning_type: full
+
+### Dataset configuration
+dataset: identity
+template: gemma4
+cutoff_len: 512
+max_samples: 100
+overwrite_cache: true
+preprocessing_num_workers: 4
+
+### Output configuration
+output_dir: saves/gemma4-2L/fp8-te/sft
+logging_steps: 5
+save_steps: 500
+overwrite_output_dir: true
+
+### Training configuration
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 4
+learning_rate: 5.0e-5
+num_train_epochs: 1.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+max_steps: 20
+
+### FP8 configuration
+fp8: true
+fp8_backend: te
