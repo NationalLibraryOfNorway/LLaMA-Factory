@@ -160,6 +160,9 @@ class FP8StorageLinear(nn.Module):
         if has_bias:
             fp8_linear.bias = linear.bias
 
+        # Tag parameter so fused optimizer can find fp8 buffers
+        fp8_linear.weight._fp8_ref = (fp8_linear, '_weight_fp8', '_weight_scale')
+
         # Quantize to fp8 and compress
         fp8_linear.compress()
         return fp8_linear
@@ -252,6 +255,12 @@ class FP8StorageExperts(nn.Module):
             return None
 
         wrapper = cls(experts_module, param_names)
+
+        # Tag parameters so fused optimizer can find fp8 buffers
+        for name in param_names:
+            param = getattr(experts_module, name)
+            param._fp8_ref = (wrapper, f'_fp8_{name}', f'_scale_{name}')
+
         wrapper.compress()
         return wrapper
 
@@ -558,24 +567,29 @@ def fp8_materialize_all(model: nn.Module) -> None:
 class FP8StorageCallback(TrainerCallback):
     """Training callback that manages the FP8 weight + gradient lifecycle.
 
-    Lifecycle per training step:
-      1. on_train_begin: compress weights to fp8 (initial state), store model ref
-      2. forward: weights auto-decompressed to bf16 by FP8StorageLinear.forward()
-      3. backward: gradient hooks compress grads to fp8_e5m2 as produced
-      4. on_pre_optimizer_step: decompress fp8 grads to bf16 for optimizer
-         (Note: HF Trainer's on_pre_optimizer_step doesn't pass model=, so we
-         store the model reference during on_train_begin and use it here.
-         This fires AFTER gradient clipping — clipping sees grad=None for hooked
-         params and skips them. This is acceptable because fp8 quantization already
-         implicitly clips by saturating at ±57344 (e5m2 max). For most training
-         scenarios the fp8 range covers the gradient distribution.)
-      5. optimizer.step(): updates bf16 weights using bf16 grads
-      6. on_step_end: compress weights back to fp8, clear grad accumulators
-      7. on_save: materialize weights to bf16 for checkpoint saving
+    Two modes depending on whether a fused optimizer (FP8Adafactor) is used:
+
+    Standard (fused_optimizer=False):
+      1. on_train_begin: compress weights, store model ref
+      2. forward: auto-decompressed by FP8StorageLinear.forward()
+      3. backward: gradient hooks compress grads to fp8_e5m2
+      4. on_pre_optimizer_step: decompress grads to bf16 for standard optimizer
+      5. optimizer.step(): standard bf16 update
+      6. on_step_end: compress weights back, clear grad accumulators
+      7. on_save: materialize for checkpoint
+
+    Fused (fused_optimizer=True):
+      1. on_train_begin: compress weights, store model ref
+      2. forward/backward: same as above
+      3. on_pre_optimizer_step: SKIP (fused optimizer reads fp8 directly)
+      4. FP8Adafactor.step(): reads fp8, updates in fp32, writes fp8
+      5. on_step_end: SKIP compress (already fp8), just clear grad accumulators
+      6. on_save: materialize for checkpoint
     """
 
-    def __init__(self, fp8_gradients: bool = True):
+    def __init__(self, fp8_gradients: bool = True, fused_optimizer: bool = False):
         self._fp8_gradients = fp8_gradients
+        self._fused_optimizer = fused_optimizer
         self._model = None
 
     def on_train_begin(self, args, state, control, model=None, **kwargs):
@@ -587,16 +601,19 @@ class FP8StorageCallback(TrainerCallback):
     def on_pre_optimizer_step(self, args, state, control, **kwargs):
         """Decompress fp8 gradients to bf16 before optimizer step.
 
-        HF Trainer calls this after gradient clipping but before optimizer.step().
-        No model kwarg is passed, so we use the stored reference from on_train_begin.
+        Skipped when using fused optimizer (it reads fp8 grads directly).
         """
+        if self._fused_optimizer:
+            return
         if self._fp8_gradients and self._model is not None:
             materialize_fp8_gradients(self._model)
 
     def on_step_end(self, args, state, control, model=None, **kwargs):
-        """After optimizer step + zero_grad, compress weights back to fp8."""
+        """After optimizer step, compress weights and clear grad accumulators."""
         if model is not None:
-            fp8_compress_all(model)
+            if not self._fused_optimizer:
+                # Standard optimizer: need to compress weights it left in bf16
+                fp8_compress_all(model)
             if self._fp8_gradients:
                 clear_fp8_grad_accumulators(model)
 

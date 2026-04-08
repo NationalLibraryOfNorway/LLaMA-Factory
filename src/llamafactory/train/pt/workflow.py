@@ -48,14 +48,19 @@ def run_pt(
 
     # Apply FP8 storage mode if requested
     fp8_mode = getattr(training_args, "fp8_mode", "auto")
+    fp8_fused_optim = None
     if getattr(training_args, "fp8", False) and fp8_mode in ("storage", "auto") and training_args.do_train:
         from ..fp8_linear import FP8StorageCallback, convert_model_to_fp8_storage
 
         skip_vision = getattr(finetuning_args, "freeze_vision_tower", True)
+        use_fused = "adafactor" in getattr(training_args, "optim", "")
         model = convert_model_to_fp8_storage(model, skip_vision_tower=skip_vision)
         if callbacks is None:
             callbacks = []
-        callbacks.append(FP8StorageCallback())
+        callbacks.append(FP8StorageCallback(fused_optimizer=use_fused))
+        if use_fused:
+            from ..fp8_optim import create_fp8_adafactor
+            fp8_fused_optim = create_fp8_adafactor(model, training_args)
 
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
@@ -69,6 +74,9 @@ def run_pt(
         **dataset_module,
         **tokenizer_module,
     )
+
+    if fp8_fused_optim is not None:
+        trainer.optimizer = fp8_fused_optim
 
     # Training
     if training_args.do_train:

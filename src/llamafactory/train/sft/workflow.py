@@ -54,14 +54,19 @@ def run_sft(
 
     # Apply FP8 storage mode if requested
     fp8_mode = getattr(training_args, "fp8_mode", "auto")
+    fp8_fused_optim = None
     if training_args.fp8 and fp8_mode in ("storage", "auto") and training_args.do_train:
         from ..fp8_linear import FP8StorageCallback, convert_model_to_fp8_storage
 
         skip_vision = getattr(finetuning_args, "freeze_vision_tower", True)
+        use_fused = "adafactor" in getattr(training_args, "optim", "")
         model = convert_model_to_fp8_storage(model, skip_vision_tower=skip_vision)
         if callbacks is None:
             callbacks = []
-        callbacks.append(FP8StorageCallback())
+        callbacks.append(FP8StorageCallback(fused_optimizer=use_fused))
+        if use_fused:
+            from ..fp8_optim import create_fp8_adafactor
+            fp8_fused_optim = create_fp8_adafactor(model, training_args)
 
     ref_model = None
     if finetuning_args.use_asft_loss:
@@ -145,6 +150,10 @@ def run_sft(
             **tokenizer_module,
             **metric_module,
         )
+
+    # Inject fused FP8 optimizer if available
+    if fp8_fused_optim is not None:
+        trainer.optimizer = fp8_fused_optim
 
     # Training
     if training_args.do_train:
