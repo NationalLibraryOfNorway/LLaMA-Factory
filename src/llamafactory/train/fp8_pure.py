@@ -94,26 +94,43 @@ class _FP8MatmulFunction(Function):
 
     All three matmuls use hardware fp8 tensor cores.
     Scales are per-tensor fp32 scalars, negligible memory.
+
+    Handles arbitrary leading batch dimensions by flattening to 2D for scaled_mm
+    (which only supports 2D inputs) and reshaping back.
     """
 
     @staticmethod
     def forward(ctx, input_bf16, weight_fp8, weight_scale, bias):
+        # Save original shape for backward reshape
+        orig_shape = input_bf16.shape
+        in_features = orig_shape[-1]
+
+        # Flatten to 2D: (*, K) → (M, K) where M = product of leading dims
+        input_2d = input_bf16.reshape(-1, in_features)
+
         # Quantize input to e4m3 for forward matmul
-        input_fp8, input_scale = _quantize_e4m3(input_bf16)
+        input_fp8, input_scale = _quantize_e4m3(input_2d)
+
+        # Pre-transpose weight to contiguous column-major for scaled_mm
+        weight_t = weight_fp8.t().contiguous()
 
         # scaled_mm: (M, K) @ (K, N) → (M, N)
-        # weight_fp8 is (out, in), we need (in, out) for matmul, so transpose
-        output = torch._scaled_mm(
+        output_2d = torch._scaled_mm(
             input_fp8,
-            weight_fp8.t(),
+            weight_t,
             scale_a=input_scale,
             scale_b=weight_scale,
             out_dtype=torch.bfloat16,
         )
 
+        # Reshape back: (M, N) → (*, N)
+        out_features = output_2d.shape[-1]
+        output = output_2d.reshape(*orig_shape[:-1], out_features)
+
         # Save for backward — keep fp8 tensors (1 byte each), not bf16
         ctx.save_for_backward(input_fp8, input_scale, weight_fp8, weight_scale)
         ctx.has_bias = bias is not None
+        ctx.orig_shape = orig_shape
 
         if bias is not None:
             output = output + bias
@@ -124,19 +141,23 @@ class _FP8MatmulFunction(Function):
     def backward(ctx, grad_output):
         input_fp8, input_scale, weight_fp8, weight_scale = ctx.saved_tensors
 
+        # Flatten grad_output to 2D
+        grad_2d = grad_output.reshape(-1, grad_output.shape[-1])
+
         # Quantize grad_output to e5m2 (wider range for gradients)
-        grad_fp8, grad_scale = _quantize_e5m2(grad_output)
+        grad_fp8, grad_scale = _quantize_e5m2(grad_2d)
 
         # grad_input = grad_output @ weight
         # (M, N) @ (N, K) = (M, K)  where weight is (out=N, in=K)
-        # scaled_mm expects (M, N) @ (N, K), weight_fp8 is already (N, K)
-        grad_input = torch._scaled_mm(
+        grad_input_2d = torch._scaled_mm(
             grad_fp8,
             weight_fp8,
             scale_a=grad_scale,
             scale_b=weight_scale,
             out_dtype=torch.bfloat16,
         )
+        # Reshape back to original input shape
+        grad_input = grad_input_2d.reshape(ctx.orig_shape)
 
         # grad_weight = grad_output^T @ input
         # (N, M) @ (M, K) = (N, K)  which is (out, in) — correct weight shape
