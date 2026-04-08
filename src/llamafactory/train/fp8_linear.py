@@ -437,7 +437,10 @@ def _should_convert_linear(name: str, module: nn.Module,
         return False
 
     # Skip tiny layers (not worth the overhead)
-    if module.weight.numel() < min_numel:
+    # Use module attributes (not weight.numel()) because ZeRO-3 partitions
+    # weight tensors into 1D shards, making numel() return the shard size
+    real_numel = module.in_features * module.out_features
+    if real_numel < min_numel:
         return False
 
     # Skip layers with dimensions not meeting alignment requirement
