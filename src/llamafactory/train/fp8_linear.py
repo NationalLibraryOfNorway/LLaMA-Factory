@@ -22,6 +22,13 @@ This module implements two complementary memory optimizations for training:
    for forward/backward. After optimizer step, recompressed to fp8.
    Memory savings require gradient checkpointing.
 
+   Supports two module types:
+   - nn.Linear layers → replaced by FP8StorageLinear
+   - MoE expert modules with 3D weight tensors (e.g. Mixtral, Qwen MoE)
+     → wrapped by FP8StorageExperts. These store gate_up_proj/down_proj as
+     3D nn.Parameter tensors, not nn.Linear. The wrapper manages the same
+     compress/materialize lifecycle around the original module.
+
 2. FP8 Gradient Compression (float8_e5m2, 1 byte/param)
    Gradients are compressed to fp8 immediately as they're produced during
    backward. This halves gradient memory from 2B/param (bf16) to 1B/param.
@@ -195,6 +202,102 @@ class FP8StorageLinear(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# FP8 MoE Expert Storage
+# ---------------------------------------------------------------------------
+
+class FP8StorageExperts(nn.Module):
+    """Wrapper for MoE expert modules that stores 3D weight parameters in fp8.
+
+    MoE models (Mixtral, Qwen MoE, GLM MoE, etc.) store expert weights as 3D
+    nn.Parameter tensors like gate_up_proj[num_experts, 2*intermediate, hidden],
+    not as nn.Linear. This wrapper handles the compress/materialize lifecycle
+    for these 3D parameters, identical in spirit to FP8StorageLinear.
+
+    The original module is kept as self._inner. Its parameters remain visible
+    to the optimizer (they're discovered via recursive parameter search).
+    Between steps, param.data is swapped to empty tensors to free memory,
+    with the actual values stored in fp8 buffers on this wrapper.
+    """
+
+    def __init__(self, experts_module: nn.Module, expert_param_names: list[str]):
+        super().__init__()
+        self._inner = experts_module
+        self._expert_param_names = expert_param_names
+        self._compressed = False
+
+        # Create fp8 storage buffers for each expert parameter
+        for name in expert_param_names:
+            param = getattr(experts_module, name)
+            self.register_buffer(
+                f'_fp8_{name}',
+                torch.zeros(param.shape, device=param.device, dtype=torch.float8_e4m3fn),
+            )
+            self.register_buffer(
+                f'_scale_{name}',
+                torch.ones(1, device=param.device, dtype=torch.float32),
+            )
+
+    @classmethod
+    def from_experts(cls, experts_module: nn.Module) -> Optional["FP8StorageExperts"]:
+        """Wrap an experts module if it has 3D weight parameters.
+
+        Returns None if no eligible parameters found.
+        """
+        param_names = []
+        for name, param in experts_module.named_parameters(recurse=False):
+            if param.dim() >= 3 and param.numel() >= 1024:
+                param_names.append(name)
+
+        if not param_names:
+            return None
+
+        wrapper = cls(experts_module, param_names)
+        wrapper.compress()
+        return wrapper
+
+    def compress(self):
+        """Compress all 3D expert weights to fp8, free bf16 data."""
+        if self._compressed:
+            return
+
+        for name in self._expert_param_names:
+            param = getattr(self._inner, name)
+            if param.data.numel() == 0:
+                continue
+            fp8_data, scale = quantize_to_fp8(param.data, dtype=torch.float8_e4m3fn)
+            getattr(self, f'_fp8_{name}').copy_(fp8_data)
+            getattr(self, f'_scale_{name}').copy_(scale)
+            param.data = torch.empty(0, device=param.device, dtype=param.dtype)
+
+        self._compressed = True
+
+    def materialize(self):
+        """Decompress all fp8 expert weights back to bf16."""
+        if not self._compressed:
+            return
+
+        for name in self._expert_param_names:
+            param = getattr(self._inner, name)
+            fp8_data = getattr(self, f'_fp8_{name}')
+            scale = getattr(self, f'_scale_{name}')
+            param.data = dequantize_from_fp8(fp8_data, scale, dtype=param.dtype)
+
+        self._compressed = False
+
+    def forward(self, *args, **kwargs):
+        self.materialize()
+        return self._inner.forward(*args, **kwargs)
+
+    def __getattr__(self, name):
+        # Delegate attribute access to inner module for compatibility
+        # (e.g. accessing num_experts, act_fn, etc.)
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self._inner, name)
+
+
+# ---------------------------------------------------------------------------
 # FP8 Gradient Compression
 # ---------------------------------------------------------------------------
 
@@ -238,20 +341,41 @@ def _make_fp8_grad_hook(param: nn.Parameter):
     return hook
 
 
-def install_fp8_grad_hooks(model: nn.Module) -> list:
-    """Install fp8 gradient compression hooks on all FP8StorageLinear parameters.
+def _is_fp8_managed(module: nn.Module) -> bool:
+    """Check if a module is an FP8-managed module (linear or experts)."""
+    return isinstance(module, (FP8StorageLinear, FP8StorageExperts))
 
-    Returns list of hook handles (call .remove() to uninstall).
-    """
-    handles = []
-    hooked = 0
+
+def _iter_fp8_params(model: nn.Module):
+    """Iterate over all parameters managed by FP8 modules."""
     for module in model.modules():
         if isinstance(module, FP8StorageLinear):
             for param in module.parameters():
                 if param.requires_grad:
-                    handle = param.register_post_accumulate_grad_hook(_make_fp8_grad_hook(param))
-                    handles.append(handle)
-                    hooked += 1
+                    yield param
+        elif isinstance(module, FP8StorageExperts):
+            # Yield the inner module's parameters (the 3D expert weights)
+            for param in module._inner.parameters():
+                if param.requires_grad:
+                    yield param
+
+
+def install_fp8_grad_hooks(model: nn.Module) -> list:
+    """Install fp8 gradient compression hooks on all FP8-managed parameters.
+
+    Covers both FP8StorageLinear (2D) and FP8StorageExperts (3D) parameters.
+    Returns list of hook handles (call .remove() to uninstall).
+    """
+    handles = []
+    hooked = 0
+    seen = set()
+    for param in _iter_fp8_params(model):
+        if id(param) in seen:
+            continue
+        seen.add(id(param))
+        handle = param.register_post_accumulate_grad_hook(_make_fp8_grad_hook(param))
+        handles.append(handle)
+        hooked += 1
     logger.info_rank0(f"FP8 gradients: installed compression hooks on {hooked} parameters.")
     return handles
 
@@ -262,26 +386,21 @@ def materialize_fp8_gradients(model: nn.Module) -> None:
     Must be called before optimizer.step(). The optimizer expects param.grad
     in bf16/fp32. After the optimizer step, gradients are zeroed anyway.
     """
-    for module in model.modules():
-        if isinstance(module, FP8StorageLinear):
-            for param in module.parameters():
-                if hasattr(param, '_grad_fp8') and param._grad_fp8 is not None:
-                    param.grad = dequantize_from_fp8(
-                        param._grad_fp8, param._grad_scale, dtype=param.dtype
-                    )
-                    # Clear fp8 accumulator for next step
-                    param._grad_fp8 = None
-                    param._grad_scale = None
+    for param in _iter_fp8_params(model):
+        if hasattr(param, '_grad_fp8') and param._grad_fp8 is not None:
+            param.grad = dequantize_from_fp8(
+                param._grad_fp8, param._grad_scale, dtype=param.dtype
+            )
+            param._grad_fp8 = None
+            param._grad_scale = None
 
 
 def clear_fp8_grad_accumulators(model: nn.Module) -> None:
     """Clear fp8 gradient accumulators after optimizer.zero_grad()."""
-    for module in model.modules():
-        if isinstance(module, FP8StorageLinear):
-            for param in module.parameters():
-                if hasattr(param, '_grad_fp8'):
-                    param._grad_fp8 = None
-                    param._grad_scale = None
+    for param in _iter_fp8_params(model):
+        if hasattr(param, '_grad_fp8'):
+            param._grad_fp8 = None
+            param._grad_scale = None
 
 
 # ---------------------------------------------------------------------------
@@ -292,10 +411,14 @@ def clear_fp8_grad_accumulators(model: nn.Module) -> None:
 _SKIP_MODULES = {"lm_head", "embed_tokens", "embed_positions", "wte", "wpe",
                  "embed_vision", "embedding_projection"}
 
+# Common names for MoE expert modules across transformers models.
+# These contain 3D nn.Parameter tensors (gate_up_proj, down_proj, etc.)
+_EXPERT_MODULE_NAMES = {"experts", "expert"}
 
-def _should_convert_module(name: str, module: nn.Module,
+
+def _should_convert_linear(name: str, module: nn.Module,
                            min_numel: int = 1024, require_alignment: int = 16) -> bool:
-    """Check if a module should be converted to FP8."""
+    """Check if an nn.Linear module should be converted to FP8."""
     if not isinstance(module, nn.Linear):
         return False
 
@@ -315,26 +438,51 @@ def _should_convert_module(name: str, module: nn.Module,
     return True
 
 
+def _is_expert_module(name: str, module: nn.Module) -> bool:
+    """Check if a module is a MoE experts module with 3D weight parameters.
+
+    Detects modules like MixtralExperts, Qwen2MoeExperts, etc. that store
+    expert weights as 3D nn.Parameter tensors (not nn.Linear).
+    """
+    # Check by name
+    leaf_name = name.split(".")[-1] if name else ""
+    if leaf_name not in _EXPERT_MODULE_NAMES:
+        return False
+
+    # Verify it has 3D parameters (the hallmark of expert weight storage)
+    for param_name, param in module.named_parameters(recurse=False):
+        if param.dim() >= 3 and param.numel() >= 1024:
+            return True
+
+    return False
+
+
 def convert_model_to_fp8_storage(model: nn.Module, skip_vision_tower: bool = True,
                                   min_numel: int = 1024, require_alignment: int = 16,
                                   fp8_gradients: bool = True) -> nn.Module:
-    """Replace nn.Linear modules with FP8StorageLinear for memory-efficient training.
+    """Convert model to use FP8 weight storage for memory-efficient training.
+
+    Handles two module types:
+    - nn.Linear layers → replaced by FP8StorageLinear
+    - MoE expert modules with 3D weight tensors → wrapped by FP8StorageExperts
 
     Args:
         model: The model to convert.
         skip_vision_tower: If True, skip vision tower modules (for multimodal models).
-        min_numel: Minimum parameter count for conversion.
-        require_alignment: Required dimension alignment (0 to disable).
+        min_numel: Minimum parameter count for linear layer conversion.
+        require_alignment: Required dimension alignment for linear layers (0 to disable).
         fp8_gradients: If True, also install fp8 gradient compression hooks.
 
     Returns:
-        The model with linear layers replaced by FP8StorageLinear.
+        The model with eligible modules converted to FP8 storage.
     """
-    converted = 0
-    skipped = 0
+    linear_converted = 0
+    linear_skipped = 0
+    expert_converted = 0
+    expert_params_total = 0
 
     # Collect modules to replace (can't modify during iteration)
-    replacements: list[tuple[nn.Module, str, FP8StorageLinear]] = []
+    replacements: list[tuple[nn.Module, str, nn.Module]] = []
 
     for name, module in model.named_modules():
         # Skip vision tower
@@ -343,24 +491,43 @@ def convert_model_to_fp8_storage(model: nn.Module, skip_vision_tower: bool = Tru
 
         for child_name, child in module.named_children():
             full_name = f"{name}.{child_name}" if name else child_name
-            if _should_convert_module(full_name, child, min_numel=min_numel, require_alignment=require_alignment):
+
+            # Check for MoE expert modules (3D parameter tensors)
+            if _is_expert_module(full_name, child):
+                wrapper = FP8StorageExperts.from_experts(child)
+                if wrapper is not None:
+                    replacements.append((module, child_name, wrapper))
+                    expert_converted += 1
+                    expert_params_total += sum(
+                        getattr(wrapper, f'_fp8_{n}').numel()
+                        for n in wrapper._expert_param_names
+                    )
+                continue
+
+            # Check for nn.Linear modules
+            if _should_convert_linear(full_name, child, min_numel=min_numel, require_alignment=require_alignment):
                 fp8_linear = FP8StorageLinear.from_linear(child)
                 replacements.append((module, child_name, fp8_linear))
-                converted += 1
+                linear_converted += 1
             elif isinstance(child, nn.Linear):
-                skipped += 1
+                linear_skipped += 1
 
     # Apply replacements
     for parent, child_name, fp8_module in replacements:
         setattr(parent, child_name, fp8_module)
 
-    logger.info_rank0(
-        f"FP8 storage: converted {converted} linear layers, skipped {skipped}. "
-        f"Weight memory reduced by ~{converted * 50 // max(converted + skipped, 1)}%."
-    )
+    total_converted = linear_converted + expert_converted
+    if total_converted > 0:
+        msg = f"FP8 storage: converted {linear_converted} linear layers"
+        if expert_converted > 0:
+            msg += f", {expert_converted} expert modules ({expert_params_total:,} expert params)"
+        msg += f", skipped {linear_skipped} layers."
+        logger.info_rank0(msg)
+    else:
+        logger.info_rank0("FP8 storage: no eligible modules found for conversion.")
 
     # Install gradient compression hooks
-    if fp8_gradients and converted > 0:
+    if fp8_gradients and total_converted > 0:
         install_fp8_grad_hooks(model)
 
     return model
@@ -371,16 +538,16 @@ def convert_model_to_fp8_storage(model: nn.Module, skip_vision_tower: bool = Tru
 # ---------------------------------------------------------------------------
 
 def fp8_compress_all(model: nn.Module) -> None:
-    """Compress all FP8StorageLinear weights to fp8. Call after optimizer.step()."""
+    """Compress all FP8-managed weights to fp8. Call after optimizer.step()."""
     for module in model.modules():
-        if isinstance(module, FP8StorageLinear):
+        if isinstance(module, (FP8StorageLinear, FP8StorageExperts)):
             module.compress()
 
 
 def fp8_materialize_all(model: nn.Module) -> None:
-    """Materialize all FP8StorageLinear weights to bf16. Call before saving."""
+    """Materialize all FP8-managed weights to bf16. Call before saving."""
     for module in model.modules():
-        if isinstance(module, FP8StorageLinear):
+        if isinstance(module, (FP8StorageLinear, FP8StorageExperts)):
             module.materialize()
 
 
