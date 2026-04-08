@@ -546,17 +546,25 @@ def convert_model_to_fp8_storage(model: nn.Module, skip_vision_tower: bool = Tru
 # Weight compression/materialization utilities
 # ---------------------------------------------------------------------------
 
+def _is_fp8_module(module: nn.Module) -> bool:
+    """Check if a module is any FP8-managed type."""
+    if isinstance(module, (FP8StorageLinear, FP8StorageExperts)):
+        return True
+    # Also handle FP8PureLinear from fp8_pure module (avoid circular import)
+    return type(module).__name__ == "FP8PureLinear" and hasattr(module, 'compress')
+
+
 def fp8_compress_all(model: nn.Module) -> None:
     """Compress all FP8-managed weights to fp8. Call after optimizer.step()."""
     for module in model.modules():
-        if isinstance(module, (FP8StorageLinear, FP8StorageExperts)):
+        if _is_fp8_module(module):
             module.compress()
 
 
 def fp8_materialize_all(model: nn.Module) -> None:
     """Materialize all FP8-managed weights to bf16. Call before saving."""
     for module in model.modules():
-        if isinstance(module, (FP8StorageLinear, FP8StorageExperts)):
+        if _is_fp8_module(module):
             module.materialize()
 
 
