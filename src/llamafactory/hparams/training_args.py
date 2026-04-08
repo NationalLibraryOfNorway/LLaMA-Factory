@@ -80,6 +80,16 @@ class Fp8Arguments:
             "help": "FP8 backend to use ('auto', 'torchao', 'te', 'msamp'). 'auto' selects best available backend."
         },
     )
+    fp8_mode: str = field(
+        default="auto",
+        metadata={
+            "help": "FP8 training mode. "
+            "'auto': selects best mode for hardware. "
+            "'storage': fp8 weight storage for memory savings (any GPU). "
+            "'pure': maximum throughput with full fp8 pipeline (Ada/Hopper only, experimental). "
+            "'accelerate': existing Accelerate-based fp8 integration (legacy)."
+        },
+    )
     fp8_enable_fsdp_float8_all_gather: bool = field(
         default=False,
         metadata={"help": "Enable FP8 optimizations for FSDP2 all-gather operations."},

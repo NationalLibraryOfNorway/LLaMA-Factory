@@ -52,6 +52,17 @@ def run_sft(
     dataset_module = get_dataset(template, model_args, data_args, training_args, stage="sft", **tokenizer_module)
     model = load_model(tokenizer, model_args, finetuning_args, training_args.do_train)
 
+    # Apply FP8 storage mode if requested
+    fp8_mode = getattr(training_args, "fp8_mode", "auto")
+    if training_args.fp8 and fp8_mode in ("storage", "auto") and training_args.do_train:
+        from ..fp8_linear import FP8StorageCallback, convert_model_to_fp8_storage
+
+        skip_vision = getattr(finetuning_args, "freeze_vision_tower", True)
+        model = convert_model_to_fp8_storage(model, skip_vision_tower=skip_vision)
+        if callbacks is None:
+            callbacks = []
+        callbacks.append(FP8StorageCallback())
+
     ref_model = None
     if finetuning_args.use_asft_loss:
         ref_model = create_ref_model(model_args, finetuning_args)
