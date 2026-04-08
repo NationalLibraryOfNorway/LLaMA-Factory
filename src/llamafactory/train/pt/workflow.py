@@ -18,6 +18,7 @@
 import math
 from typing import TYPE_CHECKING, Optional
 
+import torch
 from transformers import DataCollatorForLanguageModeling
 
 from ...data import get_dataset, get_template_and_fix_tokenizer
@@ -53,7 +54,7 @@ def run_pt(
         skip_vision = getattr(finetuning_args, "freeze_vision_tower", True)
         use_fused = "adafactor" in getattr(training_args, "optim", "")
 
-        if fp8_mode == "pure":
+        if fp8_mode == "pure" or (fp8_mode == "auto" and torch.cuda.get_device_capability() >= (8, 9)):
             from ..fp8_pure import convert_model_to_fp8_pure
             model = convert_model_to_fp8_pure(model, skip_vision_tower=skip_vision)
         else:
