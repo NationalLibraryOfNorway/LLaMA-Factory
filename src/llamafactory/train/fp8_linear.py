@@ -123,10 +123,12 @@ class FP8StorageLinear(nn.Module):
     """
 
     def __init__(self, in_features: int, out_features: int, bias: bool = False,
-                 device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None):
+                 device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None,
+                 use_native_fp8: bool = False):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
+        self._use_native_fp8 = use_native_fp8
 
         # The bf16 parameter that autograd and optimizer interact with.
         # Between steps, its .data is swapped to an empty tensor to free memory.
@@ -146,7 +148,7 @@ class FP8StorageLinear(nn.Module):
         self._compressed = False
 
     @classmethod
-    def from_linear(cls, linear: nn.Linear) -> "FP8StorageLinear":
+    def from_linear(cls, linear: nn.Linear, use_native_fp8: bool = False) -> "FP8StorageLinear":
         """Create FP8StorageLinear from an existing nn.Linear, quantizing its weights."""
         has_bias = linear.bias is not None
         fp8_linear = cls(
@@ -154,6 +156,7 @@ class FP8StorageLinear(nn.Module):
             bias=has_bias,
             device=linear.weight.device,
             dtype=linear.weight.dtype,
+            use_native_fp8=use_native_fp8,
         )
         # Copy weight data
         fp8_linear.weight = linear.weight
@@ -238,6 +241,12 @@ class FP8StorageLinear(nn.Module):
         self._compressed = False
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if getattr(self, "_use_native_fp8", False) and self._compressed:
+            from .fp8_pure import _FP8MatmulFunction
+            return _FP8MatmulFunction.apply(
+                input, self.weight, self._weight_fp8, self._weight_scale, self.bias, self
+            )
+
         self.materialize()
         output = F.linear(input, self.weight, self.bias)
         # With gradient checkpointing, the first forward runs under no_grad (activations
@@ -477,6 +486,7 @@ def install_fp8_grad_hooks(model: nn.Module) -> list:
         if id(param) in seen:
             continue
         seen.add(id(param))
+        param._fp8_grad_compression = True
         handle = param.register_post_accumulate_grad_hook(_make_fp8_grad_hook(param))
         handles.append(handle)
         hooked += 1
@@ -586,6 +596,9 @@ def convert_model_to_fp8_storage(model: nn.Module, skip_vision_tower: bool = Tru
     Returns:
         The model with eligible modules converted to FP8 storage.
     """
+    from .fp8_pure import _check_native_fp8_support, _detect_zero3
+    use_native_fp8 = _check_native_fp8_support() and not _detect_zero3()
+
     linear_converted = 0
     linear_skipped = 0
     expert_converted = 0
@@ -616,7 +629,7 @@ def convert_model_to_fp8_storage(model: nn.Module, skip_vision_tower: bool = Tru
 
             # Check for nn.Linear modules
             if _should_convert_linear(full_name, child, min_numel=min_numel, require_alignment=require_alignment):
-                fp8_linear = FP8StorageLinear.from_linear(child)
+                fp8_linear = FP8StorageLinear.from_linear(child, use_native_fp8=use_native_fp8)
                 replacements.append((module, child_name, fp8_linear))
                 linear_converted += 1
             elif isinstance(child, nn.Linear):

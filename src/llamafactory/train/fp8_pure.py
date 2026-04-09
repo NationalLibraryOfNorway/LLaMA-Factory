@@ -101,7 +101,7 @@ class _FP8MatmulFunction(Function):
     """
 
     @staticmethod
-    def forward(ctx, input_bf16, weight_proxy, weight_fp8, weight_scale, bias):
+    def forward(ctx, input_bf16, weight_proxy, weight_fp8, weight_scale, bias, module=None):
         orig_shape = input_bf16.shape
         in_features = orig_shape[-1]
 
@@ -129,6 +129,7 @@ class _FP8MatmulFunction(Function):
         ctx.save_for_backward(input_fp8, input_scale, weight_fp8, weight_scale)
         ctx.has_bias = bias is not None
         ctx.orig_shape = orig_shape
+        ctx.module = module
 
         if bias is not None:
             output = output + bias
@@ -165,8 +166,28 @@ class _FP8MatmulFunction(Function):
 
         grad_bias = grad_output.sum(dim=tuple(range(grad_output.dim() - 1))) if ctx.has_bias else None
 
-        # Returns: grad_input, grad_weight_proxy (STE), grad_weight_fp8=None, grad_scale=None, grad_bias
-        return grad_input, grad_weight, None, None, grad_bias
+        module = ctx.module
+        if module is not None and getattr(module.weight, "requires_grad", False):
+            param = module.weight
+            if getattr(param, "_fp8_grad_compression", False):
+                from .fp8_linear import quantize_to_fp8, dequantize_from_fp8
+                if hasattr(param, "_grad_fp8") and param._grad_fp8 is not None:
+                    prev = dequantize_from_fp8(param._grad_fp8, param._grad_scale, dtype=grad_weight.dtype)
+                    accumulated = prev + grad_weight
+                    fp8_grad, scale = quantize_to_fp8(accumulated, dtype=torch.float8_e5m2)
+                else:
+                    fp8_grad, scale = quantize_to_fp8(grad_weight, dtype=torch.float8_e5m2)
+                param._grad_fp8 = fp8_grad
+                param._grad_scale = scale
+                param.grad = None  # Free any bf16 grad if created
+            else:
+                if param.grad is not None:
+                    param.grad.add_(grad_weight)
+                else:
+                    param.grad = grad_weight
+
+        # Returns: grad_input, grad_weight_proxy (None), grad_weight_fp8, grad_scale, grad_bias, module
+        return grad_input, None, None, None, grad_bias, None
 
 
 class FP8PureLinear(nn.Module):
