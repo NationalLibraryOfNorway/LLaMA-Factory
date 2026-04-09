@@ -593,11 +593,11 @@ def convert_model_to_fp8_storage(model: nn.Module, skip_vision_tower: bool = Tru
     Returns:
         The model with eligible modules converted to FP8 storage.
     """
-    # Detect native fp8 matmul support (Ada Lovelace / Hopper)
-    from .fp8_pure import _check_native_fp8_support
-    use_native_fp8 = _check_native_fp8_support()
-    if use_native_fp8:
-        logger.info_rank0("FP8 storage: native fp8 matmul detected, using scaled_mm for compute.")
+    # Native fp8 matmul (scaled_mm) is incompatible with storage mode's
+    # compress lifecycle: STE needs non-empty self.weight, but compress()
+    # zeros it to empty(0). Storage mode always uses F.linear with
+    # materialized bf16 weights + backward hook to re-compress.
+    use_native_fp8 = False
 
     linear_converted = 0
     linear_skipped = 0
