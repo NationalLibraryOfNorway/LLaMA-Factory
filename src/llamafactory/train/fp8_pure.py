@@ -101,7 +101,7 @@ class _FP8MatmulFunction(Function):
     """
 
     @staticmethod
-    def forward(ctx, input_bf16, weight_proxy, weight_fp8, weight_scale, bias, module=None):
+    def forward(ctx, input_bf16, weight_proxy, weight_fp8, weight_scale, bias, module=None, slice_info=None):
         orig_shape = input_bf16.shape
         in_features = orig_shape[-1]
 
@@ -130,6 +130,7 @@ class _FP8MatmulFunction(Function):
         ctx.has_bias = bias is not None
         ctx.orig_shape = orig_shape
         ctx.module = module
+        ctx.slice_info = slice_info
 
         if bias is not None:
             output = output + bias
@@ -167,7 +168,26 @@ class _FP8MatmulFunction(Function):
         grad_bias = grad_output.sum(dim=tuple(range(grad_output.dim() - 1))) if ctx.has_bias else None
 
         module = ctx.module
-        if module is not None and getattr(module.weight, "requires_grad", False):
+        slice_info = getattr(ctx, "slice_info", None)
+
+        if slice_info is not None:
+            param, expert_idx = slice_info
+            if getattr(param, "requires_grad", False) and getattr(param, "_fp8_grad_compression", False):
+                from .fp8_linear import quantize_to_fp8, dequantize_from_fp8
+                if not hasattr(param, "_grad_fp8") or param._grad_fp8 is None:
+                    wrapper, fp8_name, _ = param._fp8_ref
+                    fp8_buf = getattr(wrapper, fp8_name)
+                    param._grad_fp8 = torch.zeros_like(fp8_buf, dtype=torch.float8_e5m2)
+                    param._grad_scale = torch.ones(fp8_buf.shape[0], 1, 1, device=param.device, dtype=torch.float32)
+                
+                prev = dequantize_from_fp8(param._grad_fp8[expert_idx], param._grad_scale[expert_idx], dtype=grad_weight.dtype)
+                accumulated = prev + grad_weight
+                fp8_grad, scale = quantize_to_fp8(accumulated, dtype=torch.float8_e5m2)
+                param._grad_fp8[expert_idx] = fp8_grad
+                param._grad_scale[expert_idx] = scale
+                param.grad = None  # Free any bf16 grad if created
+
+        elif module is not None and getattr(module.weight, "requires_grad", False):
             param = module.weight
             if getattr(param, "_fp8_grad_compression", False):
                 from .fp8_linear import quantize_to_fp8, dequantize_from_fp8
@@ -186,8 +206,8 @@ class _FP8MatmulFunction(Function):
                 else:
                     param.grad = grad_weight
 
-        # Returns: grad_input, grad_weight_proxy (None), grad_weight_fp8, grad_scale, grad_bias, module
-        return grad_input, None, None, None, grad_bias, None
+        # Returns: grad_input, grad_weight_proxy (None), grad_weight_fp8, grad_scale, grad_bias, module, slice_info
+        return grad_input, None, None, None, grad_bias, None, None
 
 
 class FP8PureLinear(nn.Module):
