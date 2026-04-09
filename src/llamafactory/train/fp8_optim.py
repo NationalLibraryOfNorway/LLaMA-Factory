@@ -182,7 +182,7 @@ class FP8Adafactor(Optimizer):
             # Ensure param.data stays empty (compressed)
             if p.data.numel() > 0:
                 p.data = torch.empty(0, device=p.device, dtype=p.dtype)
-            # Mark module as compressed (works for FP8StorageLinear, FP8StorageExperts, FP8PureLinear)
+            # Mark module as compressed (works for FP8StorageLinear, FP8StorageExperts)
             if hasattr(owner, '_compressed'):
                 owner._compressed = True
         else:

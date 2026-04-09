@@ -123,10 +123,12 @@ class FP8StorageLinear(nn.Module):
     """
 
     def __init__(self, in_features: int, out_features: int, bias: bool = False,
-                 device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None):
+                 device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None,
+                 use_native_fp8: bool = False):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
+        self._use_native_fp8 = use_native_fp8
 
         # The bf16 parameter that autograd and optimizer interact with.
         # Between steps, its .data is swapped to an empty tensor to free memory.
@@ -146,7 +148,7 @@ class FP8StorageLinear(nn.Module):
         self._compressed = False
 
     @classmethod
-    def from_linear(cls, linear: nn.Linear) -> "FP8StorageLinear":
+    def from_linear(cls, linear: nn.Linear, use_native_fp8: bool = False) -> "FP8StorageLinear":
         """Create FP8StorageLinear from an existing nn.Linear, quantizing its weights."""
         has_bias = linear.bias is not None
         fp8_linear = cls(
@@ -154,6 +156,7 @@ class FP8StorageLinear(nn.Module):
             bias=has_bias,
             device=linear.weight.device,
             dtype=linear.weight.dtype,
+            use_native_fp8=use_native_fp8,
         )
         # Copy weight data
         fp8_linear.weight = linear.weight
@@ -194,6 +197,15 @@ class FP8StorageLinear(nn.Module):
         self._compressed = False
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if self._use_native_fp8 and self._compressed:
+            # Native fp8 matmul: use fp8 buffers directly, no materialize needed.
+            # Gradients route through self.weight via STE in _FP8MatmulFunction.
+            from .fp8_pure import _FP8MatmulFunction
+            return _FP8MatmulFunction.apply(
+                input, self.weight, self._weight_fp8, self._weight_scale, self.bias
+            )
+
+        # Standard path: decompress to bf16, run matmul, re-compress
         self.materialize()
         output = F.linear(input, self.weight, self.bias)
         # Re-compress after forward to free bf16 memory.
@@ -203,9 +215,10 @@ class FP8StorageLinear(nn.Module):
         return output
 
     def extra_repr(self) -> str:
+        mode = "native_fp8" if self._use_native_fp8 else "storage"
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, "
-            f"bias={self.bias is not None}, compressed={self._compressed}"
+            f"bias={self.bias is not None}, compressed={self._compressed}, mode={mode}"
         )
 
 
@@ -506,6 +519,12 @@ def convert_model_to_fp8_storage(model: nn.Module, skip_vision_tower: bool = Tru
     Returns:
         The model with eligible modules converted to FP8 storage.
     """
+    # Detect native fp8 matmul support (Ada Lovelace / Hopper)
+    from .fp8_pure import _check_native_fp8_support
+    use_native_fp8 = _check_native_fp8_support()
+    if use_native_fp8:
+        logger.info_rank0("FP8 storage: native fp8 matmul detected, using scaled_mm for compute.")
+
     linear_converted = 0
     linear_skipped = 0
     expert_converted = 0
@@ -536,7 +555,7 @@ def convert_model_to_fp8_storage(model: nn.Module, skip_vision_tower: bool = Tru
 
             # Check for nn.Linear modules
             if _should_convert_linear(full_name, child, min_numel=min_numel, require_alignment=require_alignment):
-                fp8_linear = FP8StorageLinear.from_linear(child)
+                fp8_linear = FP8StorageLinear.from_linear(child, use_native_fp8=use_native_fp8)
                 replacements.append((module, child_name, fp8_linear))
                 linear_converted += 1
             elif isinstance(child, nn.Linear):
@@ -548,7 +567,8 @@ def convert_model_to_fp8_storage(model: nn.Module, skip_vision_tower: bool = Tru
 
     total_converted = linear_converted + expert_converted
     if total_converted > 0:
-        msg = f"FP8 storage: converted {linear_converted} linear layers"
+        compute = "native fp8 matmul" if use_native_fp8 else "bf16 matmul"
+        msg = f"FP8 storage ({compute}): converted {linear_converted} linear layers"
         if expert_converted > 0:
             msg += f", {expert_converted} expert modules ({expert_params_total:,} expert params)"
         msg += f", skipped {linear_skipped} layers."
@@ -568,11 +588,8 @@ def convert_model_to_fp8_storage(model: nn.Module, skip_vision_tower: bool = Tru
 # ---------------------------------------------------------------------------
 
 def _is_fp8_module(module: nn.Module) -> bool:
-    """Check if a module is any FP8-managed type."""
-    if isinstance(module, (FP8StorageLinear, FP8StorageExperts)):
-        return True
-    # Also handle FP8PureLinear from fp8_pure module (avoid circular import)
-    return type(module).__name__ == "FP8PureLinear" and hasattr(module, 'compress')
+    """Check if a module is any FP8-managed type with compress/materialize."""
+    return isinstance(module, (FP8StorageLinear, FP8StorageExperts))
 
 
 def fp8_compress_all(model: nn.Module) -> None:
@@ -628,14 +645,17 @@ class FP8StorageCallback(TrainerCallback):
             fp8_compress_all(model)
 
     def on_pre_optimizer_step(self, args, state, control, **kwargs):
-        """Decompress fp8 gradients to bf16 before optimizer step.
+        """Decompress fp8 weights and gradients to bf16 before optimizer step.
 
-        Skipped when using fused optimizer (it reads fp8 grads directly).
+        Skipped when using fused optimizer (it reads fp8 directly).
         """
         if self._fused_optimizer:
             return
-        if self._fp8_gradients and self._model is not None:
-            materialize_fp8_gradients(self._model)
+        if self._model is not None:
+            # Materialize weights so optimizer can update bf16 values
+            fp8_materialize_all(self._model)
+            if self._fp8_gradients:
+                materialize_fp8_gradients(self._model)
 
     def on_step_end(self, args, state, control, model=None, **kwargs):
         """After optimizer step, compress weights and clear grad accumulators."""

@@ -48,23 +48,20 @@ def run_dpo(
     model = load_model(tokenizer, model_args, finetuning_args, training_args.do_train)
 
     # Apply FP8 training mode if requested
-    fp8_mode = getattr(training_args, "fp8_mode", "auto")
     fp8_fused_optim = None
-    if getattr(training_args, "fp8", False) and fp8_mode in ("storage", "auto", "pure") and training_args.do_train:
+    if getattr(training_args, "fp8", False) and training_args.do_train:
         skip_vision = getattr(finetuning_args, "freeze_vision_tower", True)
         use_fused = "adafactor" in getattr(training_args, "optim", "")
-        has_native_fp8 = torch.cuda.get_device_capability() >= (8, 9)
 
-        if fp8_mode == "pure" or (fp8_mode == "auto" and has_native_fp8):
-            from ..fp8_pure import convert_model_to_fp8_pure
-            model = convert_model_to_fp8_pure(model, skip_vision_tower=skip_vision)
-            from ..fp8_linear import install_fp8_grad_hooks
-            install_fp8_grad_hooks(model)
-        elif fp8_mode in ("storage", "auto"):
-            from ..fp8_pure import _detect_zero3
-            if not _detect_zero3():
-                from ..fp8_linear import convert_model_to_fp8_storage
-                model = convert_model_to_fp8_storage(model, skip_vision_tower=skip_vision)
+        from ..fp8_pure import _detect_zero3
+        if _detect_zero3():
+            logger.warning_rank0(
+                "FP8 storage mode is incompatible with ZeRO-3 (buffers are not "
+                "partitioned). Skipping FP8 weight storage."
+            )
+        else:
+            from ..fp8_linear import convert_model_to_fp8_storage
+            model = convert_model_to_fp8_storage(model, skip_vision_tower=skip_vision)
 
         from ..fp8_linear import FP8StorageCallback
         if callbacks is None:

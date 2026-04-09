@@ -54,36 +54,24 @@ def run_sft(
     dataset_module = get_dataset(template, model_args, data_args, training_args, stage="sft", **tokenizer_module)
     model = load_model(tokenizer, model_args, finetuning_args, training_args.do_train)
 
-    # Apply FP8 training mode if requested
-    # Modes: storage (buffer-based, single GPU/DDP), pure (native fp8 matmul, Ada/Hopper),
-    #         auto (pick best for hardware + distributed strategy)
-    fp8_mode = getattr(training_args, "fp8_mode", "auto")
+    # Apply FP8 training mode if requested.
+    # Converts model weights to fp8 storage (1 byte/param). On Ada/Hopper GPUs,
+    # also uses native fp8 matmul (torch._scaled_mm) for compute speedup.
     fp8_fused_optim = None
-    if training_args.fp8 and fp8_mode in ("storage", "auto", "pure") and training_args.do_train:
+    if training_args.fp8 and training_args.do_train:
         skip_vision = getattr(finetuning_args, "freeze_vision_tower", True)
         use_fused = "adafactor" in getattr(training_args, "optim", "")
-        has_native_fp8 = torch.cuda.get_device_capability() >= (8, 9)
 
-        if fp8_mode == "pure" or (fp8_mode == "auto" and has_native_fp8):
-            # Pure mode: native fp8 matmul. Uses on-the-fly quantization.
-            from ..fp8_pure import convert_model_to_fp8_pure
-            model = convert_model_to_fp8_pure(model, skip_vision_tower=skip_vision)
-            # Install fp8 gradient compression hooks for pure mode params
-            from ..fp8_linear import install_fp8_grad_hooks
-            install_fp8_grad_hooks(model)
-        elif fp8_mode in ("storage", "auto"):
-            # Storage mode: fp8 weight buffers. Only for single GPU / DDP.
-            # With ZeRO-3, this is skipped (buffers aren't partitioned = worse memory).
-            from ..fp8_pure import _detect_zero3
-            if _detect_zero3():
-                logger.warning_rank0(
-                    "FP8 storage mode is incompatible with ZeRO-3 (buffers are not "
-                    "partitioned). Skipping FP8 weight storage. FP8 gradient hooks "
-                    "and fused optimizer will still be applied if configured."
-                )
-            else:
-                from ..fp8_linear import convert_model_to_fp8_storage
-                model = convert_model_to_fp8_storage(model, skip_vision_tower=skip_vision)
+        from ..fp8_pure import _detect_zero3
+        if _detect_zero3():
+            logger.warning_rank0(
+                "FP8 storage mode is incompatible with ZeRO-3 (buffers are not "
+                "partitioned). Skipping FP8 weight storage. FP8 gradient hooks "
+                "and fused optimizer will still be applied if configured."
+            )
+        else:
+            from ..fp8_linear import convert_model_to_fp8_storage
+            model = convert_model_to_fp8_storage(model, skip_vision_tower=skip_vision)
 
         from ..fp8_linear import FP8StorageCallback
         if callbacks is None:
