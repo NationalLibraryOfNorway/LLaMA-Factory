@@ -74,7 +74,7 @@ def _quantize_e4m3(tensor: torch.Tensor, scale: Optional[torch.Tensor] = None):
     """Quantize to float8_e4m3fn with dynamic per-tensor scaling."""
     amax = tensor.detach().abs().amax()
     if scale is None:
-        scale = (amax / _E4M3_MAX).clamp(min=1e-12)
+        scale = (amax.float() / _E4M3_MAX).clamp(min=1e-12)
     fp8 = (tensor / scale).to(torch.float8_e4m3fn)
     return fp8, scale
 
@@ -83,7 +83,7 @@ def _quantize_e5m2(tensor: torch.Tensor, scale: Optional[torch.Tensor] = None):
     """Quantize to float8_e5m2 with dynamic per-tensor scaling."""
     amax = tensor.detach().abs().amax()
     if scale is None:
-        scale = (amax / _E5M2_MAX).clamp(min=1e-12)
+        scale = (amax.float() / _E5M2_MAX).clamp(min=1e-12)
     fp8 = (tensor / scale).to(torch.float8_e5m2)
     return fp8, scale
 
@@ -93,14 +93,15 @@ class _FP8MatmulFunction(Function):
 
     Forward:  output = scaled_mm(input_e4m3, weight_e4m3^T) → bf16
     Backward: grad_input = scaled_mm(grad_output_e5m2, weight_e4m3)
-              grad_weight = scaled_mm(input_e4m3^T, grad_output_e5m2)
+              grad_weight = scaled_mm(input_e4m3^T, grad_output_e5m2) → stored in weight_proxy.grad
 
+    Uses a weight_proxy (the original nn.Parameter) for gradient routing via STE.
     All three matmuls use hardware fp8 tensor cores.
     Handles arbitrary leading batch dimensions by flattening to 2D.
     """
 
     @staticmethod
-    def forward(ctx, input_bf16, weight_fp8, weight_scale, bias):
+    def forward(ctx, input_bf16, weight_proxy, weight_fp8, weight_scale, bias):
         orig_shape = input_bf16.shape
         in_features = orig_shape[-1]
 
@@ -111,10 +112,10 @@ class _FP8MatmulFunction(Function):
         input_fp8, input_scale = _quantize_e4m3(input_2d)
 
         # scaled_mm: (M, K) @ (K, N) → (M, N)
-        weight_t = weight_fp8.t().contiguous()
+        # B must be column-major for cuBLASLt: use .t() without .contiguous()
         output_2d = torch._scaled_mm(
             input_fp8,
-            weight_t,
+            weight_fp8.t(),
             scale_a=input_scale,
             scale_b=weight_scale,
             out_dtype=torch.bfloat16,
@@ -142,9 +143,10 @@ class _FP8MatmulFunction(Function):
         grad_fp8, grad_scale = _quantize_e5m2(grad_2d)
 
         # grad_input = grad_output @ weight  (M,N) @ (N,K) = (M,K)
+        # B must be column-major: .t().contiguous().t() makes (N,K) col-major
         grad_input_2d = torch._scaled_mm(
             grad_fp8,
-            weight_fp8,
+            weight_fp8.t().contiguous().t(),
             scale_a=grad_scale,
             scale_b=weight_scale,
             out_dtype=torch.bfloat16,
@@ -152,9 +154,10 @@ class _FP8MatmulFunction(Function):
         grad_input = grad_input_2d.reshape(ctx.orig_shape)
 
         # grad_weight = grad_output^T @ input  (N,M) @ (M,K) = (N,K)
+        # B must be column-major: .t().contiguous().t() makes (M,K) col-major
         grad_weight = torch._scaled_mm(
             grad_fp8.t().contiguous(),
-            input_fp8,
+            input_fp8.t().contiguous().t(),
             scale_a=grad_scale,
             scale_b=input_scale,
             out_dtype=torch.bfloat16,
@@ -162,7 +165,8 @@ class _FP8MatmulFunction(Function):
 
         grad_bias = grad_output.sum(dim=tuple(range(grad_output.dim() - 1))) if ctx.has_bias else None
 
-        return grad_input, grad_weight, None, grad_bias
+        # Returns: grad_input, grad_weight_proxy (STE), grad_weight_fp8=None, grad_scale=None, grad_bias
+        return grad_input, grad_weight, None, None, grad_bias
 
 
 class FP8PureLinear(nn.Module):
@@ -247,17 +251,25 @@ class FP8PureLinear(nn.Module):
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         """Forward using native fp8 matmul.
 
-        In buffered mode: uses pre-compressed fp8 weight.
+        In buffered mode: uses pre-compressed fp8 weight, routes gradients
+        through self.weight via STE (straight-through estimator).
         In on-the-fly mode: quantizes the (gathered) bf16 weight each forward.
         """
         if self._use_buffers:
             if not self._compressed:
                 self.compress()
-            return _FP8MatmulFunction.apply(input, self._weight_fp8, self._weight_scale, self.bias)
+            # Pass self.weight as proxy for gradient routing (STE)
+            output = _FP8MatmulFunction.apply(
+                input, self.weight, self._weight_fp8, self._weight_scale, self.bias
+            )
+            return output
         else:
             # On-the-fly: self.weight is bf16 (gathered by ZeRO-3 during forward)
-            weight_fp8, weight_scale = _quantize_e4m3(self.weight.data)
-            return _FP8MatmulFunction.apply(input, weight_fp8, weight_scale, self.bias)
+            weight_fp8, weight_scale = _quantize_e4m3(self.weight)
+            output = _FP8MatmulFunction.apply(
+                input, self.weight, weight_fp8, weight_scale, self.bias
+            )
+            return output
 
     def extra_repr(self) -> str:
         mode = "buffered" if self._use_buffers else "on-the-fly"

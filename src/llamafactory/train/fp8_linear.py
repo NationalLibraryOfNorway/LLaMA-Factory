@@ -195,7 +195,12 @@ class FP8StorageLinear(nn.Module):
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         self.materialize()
-        return F.linear(input, self.weight, self.bias)
+        output = F.linear(input, self.weight, self.bias)
+        # Re-compress after forward to free bf16 memory.
+        # With gradient checkpointing, backward re-runs forward anyway.
+        if self.training:
+            self.compress()
+        return output
 
     def extra_repr(self) -> str:
         return (
@@ -300,7 +305,10 @@ class FP8StorageExperts(nn.Module):
 
     def forward(self, *args, **kwargs):
         self.materialize()
-        return self._inner.forward(*args, **kwargs)
+        output = self._inner.forward(*args, **kwargs)
+        if self.training:
+            self.compress()
+        return output
 
     def __getattr__(self, name):
         # Delegate attribute access to inner module for compatibility
