@@ -263,6 +263,7 @@ class FP8StorageLinear(nn.Module):
         if module.training:
             module.compress()
 
+
     def _save_to_state_dict(self, destination, prefix, keep_vars):
         """Save fp8 weights under standard keys for ecosystem compatibility.
 
@@ -308,11 +309,15 @@ class FP8StorageExperts(nn.Module):
     with the actual values stored in fp8 buffers on this wrapper.
     """
 
-    def __init__(self, experts_module: nn.Module, expert_param_names: list[str]):
+    _fp8_storage_to_param = {}
+
+    def __init__(self, experts_module: nn.Module, expert_param_names: list[str], use_native_fp8: bool = False):
         super().__init__()
         self._inner = experts_module
         self._expert_param_names = expert_param_names
         self._compressed = False
+        self._use_native_fp8 = use_native_fp8
+        self._bf16_dtype = next(experts_module.parameters()).dtype
 
         # Create fp8 storage buffers for each expert parameter
         # Use ds_shape if available (ZeRO-3 flattens params to 1D shards)
@@ -327,9 +332,10 @@ class FP8StorageExperts(nn.Module):
                 f'_scale_{name}',
                 torch.ones(1, device=param.device, dtype=torch.float32),
             )
+            FP8StorageExperts._fp8_storage_to_param[getattr(self, f'_fp8_{name}').untyped_storage().data_ptr()] = (param, getattr(self, f'_scale_{name}'))
 
     @classmethod
-    def from_experts(cls, experts_module: nn.Module) -> Optional["FP8StorageExperts"]:
+    def from_experts(cls, experts_module: nn.Module, use_native_fp8: bool = False) -> Optional["FP8StorageExperts"]:
         """Wrap an experts module if it has 3D weight parameters.
 
         Returns None if no eligible parameters found.
@@ -345,7 +351,7 @@ class FP8StorageExperts(nn.Module):
         if not param_names:
             return None
 
-        wrapper = cls(experts_module, param_names)
+        wrapper = cls(experts_module, param_names, use_native_fp8=use_native_fp8)
 
         # Tag parameters so fused optimizer can find fp8 buffers
         for name in param_names:
@@ -389,6 +395,21 @@ class FP8StorageExperts(nn.Module):
         self._compressed = False
 
     def forward(self, *args, **kwargs):
+        if getattr(self, "_use_native_fp8", False) and self._compressed:
+            # Temporarily replace param.data with fp8 buffers
+            for name in self._expert_param_names:
+                param = getattr(self._inner, name)
+                param.data = getattr(self, f'_fp8_{name}')
+                
+            output = self._inner.forward(*args, **kwargs)
+            
+            # Restore param.data to empty(0)
+            for name in self._expert_param_names:
+                param = getattr(self._inner, name)
+                param.data = torch.empty(0, device=param.device, dtype=self._bf16_dtype)
+                
+            return output
+            
         self.materialize()
         output = self._inner.forward(*args, **kwargs)
         if self.training and not torch.is_grad_enabled():
@@ -401,6 +422,7 @@ class FP8StorageExperts(nn.Module):
         if module.training:
             module.compress()
 
+
     def __getattr__(self, name):
         # Delegate attribute access to inner module for compatibility
         # (e.g. accessing num_experts, act_fn, etc.)
@@ -408,6 +430,23 @@ class FP8StorageExperts(nn.Module):
             return super().__getattr__(name)
         except AttributeError:
             return getattr(self._inner, name)
+
+
+import torch.nn.functional as F
+
+_orig_linear = F.linear
+
+def _fp8_linear_patch(input, weight, bias=None):
+    if weight.dtype == torch.float8_e4m3fn:
+        data_ptr = weight.untyped_storage().data_ptr()
+        if data_ptr in FP8StorageExperts._fp8_storage_to_param:
+            param, scale = FP8StorageExperts._fp8_storage_to_param[data_ptr]
+            expert_idx = weight.storage_offset() // weight.numel()
+            from .fp8_pure import _FP8MatmulFunction
+            return _FP8MatmulFunction.apply(input, None, weight, scale, bias, None, (param, expert_idx))
+    return _orig_linear(input, weight, bias)
+
+torch.nn.functional.linear = _fp8_linear_patch
 
 
 # ---------------------------------------------------------------------------
@@ -617,7 +656,7 @@ def convert_model_to_fp8_storage(model: nn.Module, skip_vision_tower: bool = Tru
 
             # Check for MoE expert modules (3D parameter tensors)
             if _is_expert_module(full_name, child):
-                wrapper = FP8StorageExperts.from_experts(child)
+                wrapper = FP8StorageExperts.from_experts(child, use_native_fp8=use_native_fp8)
                 if wrapper is not None:
                     replacements.append((module, child_name, wrapper))
                     expert_converted += 1
