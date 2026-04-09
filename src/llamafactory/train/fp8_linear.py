@@ -170,6 +170,44 @@ class FP8StorageLinear(nn.Module):
         fp8_linear.compress()
         return fp8_linear
 
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        """Handle loading from bf16, compressed, or fp8-native checkpoints."""
+        weight_key = prefix + "weight"
+        fp8_key = prefix + "_weight_fp8"
+        scale_key = prefix + "_weight_scale"
+        # Common external scale key patterns (e.g. from torchao, vLLM quantized models)
+        ext_scale_key = prefix + "weight_scale"
+
+        if weight_key in state_dict:
+            w = state_dict[weight_key]
+            if w.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                # FP8-native checkpoint: weight tensor is already fp8
+                if ext_scale_key in state_dict:
+                    # Scale provided — load fp8 data + scale directly, no casting
+                    state_dict[fp8_key] = w.to(torch.float8_e4m3fn)
+                    state_dict[scale_key] = state_dict.pop(ext_scale_key).to(torch.float32)
+                elif scale_key in state_dict:
+                    # Our own buffer scale key is present
+                    state_dict[fp8_key] = w.to(torch.float8_e4m3fn)
+                else:
+                    # No scale found — round-trip through bf16 to compute one
+                    fp8_data, scale = quantize_to_fp8(w.to(torch.bfloat16), dtype=torch.float8_e4m3fn)
+                    state_dict[fp8_key] = fp8_data
+                    state_dict[scale_key] = scale
+                # Replace weight with empty tensor so Parameter stays bf16
+                state_dict[weight_key] = torch.empty(0, dtype=self.weight.dtype)
+                super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
+                self._compressed = True
+                return
+            elif w.numel() == 0 and fp8_key in state_dict:
+                # Compressed checkpoint: weight is empty, fp8 buffers have data
+                super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
+                self._compressed = True
+                return
+
+        # Standard bf16 checkpoint: load normally, compress() will be called later
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
+
     def compress(self):
         """Compress bf16 weight to fp8, free bf16 data."""
         if self._compressed:
@@ -213,6 +251,26 @@ class FP8StorageLinear(nn.Module):
         if self.training:
             self.compress()
         return output
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        """Save fp8 weights under standard keys for ecosystem compatibility.
+
+        Maps internal buffers to standard keys so checkpoints work with
+        vLLM, transformers, and other inference engines:
+          weight       → fp8 data (float8_e4m3fn), not the empty bf16 shell
+          weight_scale → float32 per-tensor scale
+          bias         → saved normally if present
+        Internal _weight_fp8 and _weight_scale keys are not exposed.
+        """
+        if self._compressed:
+            # Save fp8 data as 'weight' — standard key, fp8 dtype
+            destination[prefix + "weight"] = self._weight_fp8 if keep_vars else self._weight_fp8.detach()
+            destination[prefix + "weight_scale"] = self._weight_scale if keep_vars else self._weight_scale.detach()
+        else:
+            # Not compressed (e.g. mid-optimizer-step): save bf16 weight normally
+            destination[prefix + "weight"] = self.weight if keep_vars else self.weight.detach()
+        if self.bias is not None:
+            destination[prefix + "bias"] = self.bias if keep_vars else self.bias.detach()
 
     def extra_repr(self) -> str:
         mode = "native_fp8" if self._use_native_fp8 else "storage"
@@ -630,7 +688,7 @@ class FP8StorageCallback(TrainerCallback):
       3. on_pre_optimizer_step: SKIP (fused optimizer reads fp8 directly)
       4. FP8Adafactor.step(): reads fp8, updates in fp32, writes fp8
       5. on_step_end: SKIP compress (already fp8), just clear grad accumulators
-      6. on_save: materialize for checkpoint
+      6. on_save: no-op (save fp8 buffers directly, _load_from_state_dict handles loading)
     """
 
     def __init__(self, fp8_gradients: bool = True, fused_optimizer: bool = False):
@@ -667,6 +725,5 @@ class FP8StorageCallback(TrainerCallback):
                 clear_fp8_grad_accumulators(model)
 
     def on_save(self, args, state, control, model=None, **kwargs):
-        """Materialize weights before saving checkpoint."""
-        if model is not None:
-            fp8_materialize_all(model)
+        """No-op: _save_to_state_dict handles fp8-native checkpoint format."""
+        pass
