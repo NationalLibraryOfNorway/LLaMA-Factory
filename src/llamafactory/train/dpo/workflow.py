@@ -17,13 +17,19 @@
 
 from typing import TYPE_CHECKING, Optional
 
+import torch
+
 from ...data import PairwiseDataCollatorWithPadding, get_dataset, get_template_and_fix_tokenizer
 from ...extras.constants import IGNORE_INDEX
+from ...extras.logging import get_logger
 from ...extras.misc import calculate_tps
 from ...extras.ploting import plot_loss
 from ...hparams import ModelArguments
 from ...model import load_model, load_tokenizer
 from ..trainer_utils import create_modelcard_and_push, create_ref_model
+
+
+logger = get_logger(__name__)
 
 
 if TYPE_CHECKING:
@@ -44,6 +50,30 @@ def run_dpo(
     template = get_template_and_fix_tokenizer(tokenizer, data_args)
     dataset_module = get_dataset(template, model_args, data_args, training_args, stage="rm", **tokenizer_module)
     model = load_model(tokenizer, model_args, finetuning_args, training_args.do_train)
+
+    # Apply FP8 training mode if requested
+    fp8_fused_optim = None
+    if getattr(training_args, "fp8", False) and training_args.do_train:
+        skip_vision = getattr(finetuning_args, "freeze_vision_tower", True)
+        use_fused = "adafactor" in getattr(training_args, "optim", "")
+
+        from ..fp8_pure import _detect_zero3
+        if _detect_zero3():
+            logger.warning_rank0(
+                "FP8 storage mode is incompatible with ZeRO-3 (buffers are not "
+                "partitioned). Skipping FP8 weight storage."
+            )
+        else:
+            from ..fp8_linear import convert_model_to_fp8_storage
+            model = convert_model_to_fp8_storage(model, skip_vision_tower=skip_vision)
+
+        from ..fp8_linear import FP8StorageCallback
+        if callbacks is None:
+            callbacks = []
+        callbacks.append(FP8StorageCallback(fused_optimizer=use_fused))
+        if use_fused:
+            from ..fp8_optim import create_fp8_adafactor
+            fp8_fused_optim = create_fp8_adafactor(model, training_args)
 
     data_collator = PairwiseDataCollatorWithPadding(
         template=template,
@@ -83,6 +113,9 @@ def run_dpo(
         **dataset_module,
         **tokenizer_module,
     )
+
+    if fp8_fused_optim is not None:
+        trainer.optimizer = fp8_fused_optim
 
     # Training
     if training_args.do_train:

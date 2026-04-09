@@ -160,6 +160,10 @@ def load_model(
         init_kwargs["pretrained_model_name_or_path"] = model_args.model_name_or_path
         init_kwargs["torch_dtype"] = "auto"
 
+        # Allow overriding experts implementation via env var (e.g. eager, batched_mm, grouped_mm)
+        if os.environ.get("EXPERTS_IMPLEMENTATION"):
+            init_kwargs["experts_implementation"] = os.environ["EXPERTS_IMPLEMENTATION"]
+
         if model_args.mixture_of_depths == "load":
             model = load_mod_pretrained_model(**init_kwargs)
         else:

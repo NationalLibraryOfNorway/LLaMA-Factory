@@ -16,6 +16,8 @@ import os
 import types
 from typing import TYPE_CHECKING, Any, Optional
 
+import torch
+
 from ..extras import logging
 
 
@@ -24,6 +26,21 @@ if TYPE_CHECKING:
 
 
 logger = logging.get_logger(__name__)
+
+# FP8 hardware support requires compute capability >= 8.9 (Ada Lovelace / Hopper)
+_FP8_MIN_COMPUTE_CAPABILITY = (8, 9)
+
+
+def _has_native_fp8_support() -> bool:
+    """Check if the current GPU supports native FP8 (compute capability >= 8.9)."""
+    if not torch.cuda.is_available():
+        return False
+
+    try:
+        capability = torch.cuda.get_device_capability()
+        return capability >= _FP8_MIN_COMPUTE_CAPABILITY
+    except Exception:
+        return False
 
 
 def create_fp8_kwargs(training_args: "TrainingArguments") -> list[Any]:
@@ -44,10 +61,19 @@ def create_fp8_kwargs(training_args: "TrainingArguments") -> list[Any]:
     try:
         # Use Transformer Engine backend (optimal for Hopper GPUs)
         if backend == "te":
-            from accelerate.utils import FP8RecipeKwargs
+            if not _has_native_fp8_support():
+                capability = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
+                logger.warning_rank0(
+                    f"GPU compute capability {capability[0]}.{capability[1]} < 8.9: "
+                    f"Transformer Engine FP8 requires native hardware support. "
+                    f"Falling back to TorchAO with emulation mode."
+                )
+                backend = "torchao"  # fall through to TorchAO path below
+            else:
+                from accelerate.utils import FP8RecipeKwargs
 
-            logger.info_rank0("Using Transformer Engine FP8 backend")
-            return [FP8RecipeKwargs(backend="TE", fp8_format="HYBRID", amax_history_len=16, amax_compute_algo="max")]
+                logger.info_rank0("Using Transformer Engine FP8 backend (native Hopper support)")
+                return [FP8RecipeKwargs(backend="TE", fp8_format="HYBRID", amax_history_len=16, amax_compute_algo="max")]
 
         # Use TorchAO backend (default)
         from accelerate.utils import AORecipeKwargs
@@ -57,15 +83,30 @@ def create_fp8_kwargs(training_args: "TrainingArguments") -> list[Any]:
         if backend == "torchao" or backend == "auto":
             from torchao.float8 import Float8LinearConfig
 
-            # Use rowwise scaling for better performance (as recommended by torchao)
-            # Configure alignment requirements for FP8 kernels
-            config = Float8LinearConfig.from_recipe_name("rowwise")
+            native_fp8 = _has_native_fp8_support()
+            if native_fp8:
+                # Use rowwise scaling for better performance (as recommended by torchao)
+                config = Float8LinearConfig.from_recipe_name("rowwise")
 
-            # Enable alignment for better kernel performance
-            if hasattr(config, "enable_amax_init"):
-                config.enable_amax_init = True
-            if hasattr(config, "enable_pre_and_post_forward"):
-                config.enable_pre_and_post_forward = True
+                # Enable alignment for better kernel performance
+                if hasattr(config, "enable_amax_init"):
+                    config.enable_amax_init = True
+                if hasattr(config, "enable_pre_and_post_forward"):
+                    config.enable_pre_and_post_forward = True
+
+                logger.info_rank0("Using native FP8 kernels (compute capability >= 8.9)")
+            else:
+                # Emulation mode: FP8 quantization/dequantization in software.
+                # No throughput gain, but validates the FP8 code path and provides
+                # memory savings from FP8 weight storage.
+                capability = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
+                config = Float8LinearConfig(emulate=True)
+                logger.warning_rank0(
+                    f"GPU compute capability {capability[0]}.{capability[1]} < 8.9: "
+                    f"native FP8 not supported. Using emulation mode (no throughput gain, "
+                    f"but FP8 code path will be exercised). "
+                    f"For native FP8, use Ada Lovelace (RTX 40xx, L4) or Hopper (H100, GH200) GPUs."
+                )
 
         # Create module filter function to skip problematic layers
         # TorchAO FP8 requires dimensions divisible by 16 for optimal kernels
@@ -149,7 +190,10 @@ def configure_fp8_environment(training_args: "TrainingArguments") -> None:
         os.environ["FP8_ENABLE_FSDP_FLOAT8_ALL_GATHER"] = "true"
         logger.info_rank0("Set FP8_ENABLE_FSDP_FLOAT8_ALL_GATHER=true")
 
-    logger.info_rank0("FP8 environment configured - all FP8 training handled by HuggingFace Accelerate")
+    if _has_native_fp8_support():
+        logger.info_rank0("FP8 environment configured (native hardware support detected)")
+    else:
+        logger.info_rank0("FP8 environment configured (emulation mode - no native hardware support)")
 
 
 def verify_fp8_status(accelerator, training_args: "TrainingArguments") -> None:
@@ -167,19 +211,21 @@ def verify_fp8_status(accelerator, training_args: "TrainingArguments") -> None:
     fp8_backend_type = getattr(accelerator, "fp8_backend", "UNKNOWN")
 
     backend = getattr(training_args, "fp8_backend", "auto")
+    native_fp8 = _has_native_fp8_support()
+    mode = "native" if native_fp8 else "emulated"
+
     if backend == "torchao" or backend == "auto":
         logger.info_rank0(
-            "FP8 training enabled with TorchAO backend. For optimal performance, "
-            "ensure model layer dimensions are mostly divisible by 16. "
-            "If you encounter issues, try fp8_backend='te' with Transformer Engine."
+            f"FP8 training enabled with TorchAO backend ({mode} mode). "
+            "For optimal performance, ensure model layer dimensions are mostly divisible by 16."
         )
     else:
-        logger.info_rank0(f"FP8 training enabled with {backend} backend.")
+        logger.info_rank0(f"FP8 training enabled with {backend} backend ({mode} mode).")
 
     logger.info_rank0(f"Accelerate FP8 status - enabled: {fp8_enabled}, backend: {fp8_backend_type}")
 
     if not fp8_enabled:
-        logger.info_rank0("WARNING: FP8 was requested but Accelerate shows fp8_enabled=False. FP8 may not be working.")
+        logger.warning_rank0("FP8 was requested but Accelerate shows fp8_enabled=False. FP8 may not be working.")
 
 
 def patch_accelerator_for_fp8() -> None:
