@@ -250,10 +250,15 @@ class FP8StorageLinear(nn.Module):
             )
 
         # Standard path: decompress to bf16, run matmul.
-        # bf16 weight stays materialized through backward (needed for grad computation).
-        # Backward hook (_compress_after_backward) re-compresses after gradients are done.
         self.materialize()
-        return F.linear(input, self.weight, self.bias)
+        output = F.linear(input, self.weight, self.bias)
+        # With gradient checkpointing, the first forward runs under no_grad (activations
+        # are discarded). Compress here to free bf16 memory per-layer. During the backward
+        # re-run (enable_grad), weight stays bf16 for gradient computation; the backward
+        # hook (_compress_after_backward) re-compresses after gradients are done.
+        if self.training and not torch.is_grad_enabled():
+            self.compress()
+        return output
 
     @staticmethod
     def _compress_after_backward(module, grad_input, grad_output):
@@ -389,7 +394,10 @@ class FP8StorageExperts(nn.Module):
 
     def forward(self, *args, **kwargs):
         self.materialize()
-        return self._inner.forward(*args, **kwargs)
+        output = self._inner.forward(*args, **kwargs)
+        if self.training and not torch.is_grad_enabled():
+            self.compress()
+        return output
 
     @staticmethod
     def _compress_after_backward(module, grad_input, grad_output):
