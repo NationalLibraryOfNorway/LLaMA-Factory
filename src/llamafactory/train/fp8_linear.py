@@ -168,6 +168,12 @@ class FP8StorageLinear(nn.Module):
 
         # Quantize to fp8 and compress
         fp8_linear.compress()
+
+        # Register backward hook to re-compress after gradient computation.
+        # This ensures bf16 weight is available during backward (needed for
+        # grad_input = grad_output @ weight), then freed immediately after.
+        fp8_linear.register_full_backward_hook(cls._compress_after_backward)
+
         return fp8_linear
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
@@ -243,14 +249,17 @@ class FP8StorageLinear(nn.Module):
                 input, self.weight, self._weight_fp8, self._weight_scale, self.bias
             )
 
-        # Standard path: decompress to bf16, run matmul, re-compress
+        # Standard path: decompress to bf16, run matmul.
+        # bf16 weight stays materialized through backward (needed for grad computation).
+        # Backward hook (_compress_after_backward) re-compresses after gradients are done.
         self.materialize()
-        output = F.linear(input, self.weight, self.bias)
-        # Re-compress after forward to free bf16 memory.
-        # With gradient checkpointing, backward re-runs forward anyway.
-        if self.training:
-            self.compress()
-        return output
+        return F.linear(input, self.weight, self.bias)
+
+    @staticmethod
+    def _compress_after_backward(module, grad_input, grad_output):
+        """Backward hook: compress bf16→fp8 after gradient computation finishes."""
+        if module.training:
+            module.compress()
 
     def _save_to_state_dict(self, destination, prefix, keep_vars):
         """Save fp8 weights under standard keys for ecosystem compatibility.
@@ -343,6 +352,10 @@ class FP8StorageExperts(nn.Module):
             param._fp8_ref = (wrapper, f'_fp8_{name}', f'_scale_{name}')
 
         wrapper.compress()
+
+        # Register backward hook to re-compress after gradient computation
+        wrapper.register_full_backward_hook(cls._compress_after_backward)
+
         return wrapper
 
     def compress(self):
@@ -376,10 +389,13 @@ class FP8StorageExperts(nn.Module):
 
     def forward(self, *args, **kwargs):
         self.materialize()
-        output = self._inner.forward(*args, **kwargs)
-        if self.training:
-            self.compress()
-        return output
+        return self._inner.forward(*args, **kwargs)
+
+    @staticmethod
+    def _compress_after_backward(module, grad_input, grad_output):
+        """Backward hook: compress bf16→fp8 after gradient computation finishes."""
+        if module.training:
+            module.compress()
 
     def __getattr__(self, name):
         # Delegate attribute access to inner module for compatibility
