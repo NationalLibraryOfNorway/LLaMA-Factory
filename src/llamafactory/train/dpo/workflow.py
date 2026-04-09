@@ -58,6 +58,8 @@ def run_dpo(
         if fp8_mode == "pure" or (fp8_mode == "auto" and has_native_fp8):
             from ..fp8_pure import convert_model_to_fp8_pure
             model = convert_model_to_fp8_pure(model, skip_vision_tower=skip_vision)
+            from ..fp8_linear import install_fp8_grad_hooks
+            install_fp8_grad_hooks(model)
         elif fp8_mode in ("storage", "auto"):
             from ..fp8_pure import _detect_zero3
             if not _detect_zero3():

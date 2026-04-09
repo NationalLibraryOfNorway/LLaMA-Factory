@@ -364,14 +364,16 @@ def _make_fp8_grad_hook(param: nn.Parameter):
 
 
 def _is_fp8_managed(module: nn.Module) -> bool:
-    """Check if a module is an FP8-managed module (linear or experts)."""
-    return isinstance(module, (FP8StorageLinear, FP8StorageExperts))
+    """Check if a module is an FP8-managed module (linear, experts, or pure)."""
+    from .fp8_pure import FP8PureLinear
+    return isinstance(module, (FP8StorageLinear, FP8StorageExperts, FP8PureLinear))
 
 
 def _iter_fp8_params(model: nn.Module):
-    """Iterate over all parameters managed by FP8 modules."""
+    """Iterate over all parameters managed by FP8 modules (storage, experts, and pure)."""
+    from .fp8_pure import FP8PureLinear
     for module in model.modules():
-        if isinstance(module, FP8StorageLinear):
+        if isinstance(module, (FP8StorageLinear, FP8PureLinear)):
             for param in module.parameters():
                 if param.requires_grad:
                     yield param

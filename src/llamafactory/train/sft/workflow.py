@@ -65,9 +65,12 @@ def run_sft(
         has_native_fp8 = torch.cuda.get_device_capability() >= (8, 9)
 
         if fp8_mode == "pure" or (fp8_mode == "auto" and has_native_fp8):
-            # Pure mode: native fp8 matmul. Auto-detects ZeRO-3 and skips buffers.
+            # Pure mode: native fp8 matmul. Uses on-the-fly quantization.
             from ..fp8_pure import convert_model_to_fp8_pure
             model = convert_model_to_fp8_pure(model, skip_vision_tower=skip_vision)
+            # Install fp8 gradient compression hooks for pure mode params
+            from ..fp8_linear import install_fp8_grad_hooks
+            install_fp8_grad_hooks(model)
         elif fp8_mode in ("storage", "auto"):
             # Storage mode: fp8 weight buffers. Only for single GPU / DDP.
             # With ZeRO-3, this is skipped (buffers aren't partitioned = worse memory).

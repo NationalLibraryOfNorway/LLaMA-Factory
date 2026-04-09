@@ -172,24 +172,20 @@ class _FP8MatmulFunction(Function):
 class FP8PureLinear(nn.Module):
     """Linear layer using native fp8 matmul for maximum throughput.
 
-    Two modes:
-    - Buffered (single GPU / DDP): fp8 weight stored in persistent buffer,
-      bf16 weight freed between steps. Maximum memory savings + speed.
-    - On-the-fly (ZeRO-3 / FSDP): no buffers, weight stays as bf16 Parameter
-      managed by the distributed backend. Quantized to fp8 each forward.
-      Still get ~2x matmul speed; memory handled by ZeRO-3 sharding.
+    Weight stays as bf16 nn.Parameter (optimizer updates it, gradients flow
+    through it via STE). Each forward quantizes weight to fp8 on-the-fly for
+    torch._scaled_mm. FP8 gradient compression hooks (installed separately)
+    reduce gradient memory by ~50%.
 
     Requires CUDA compute capability >= 8.9 (Ada Lovelace / RTX 4090+).
     """
 
     def __init__(self, in_features: int, out_features: int, bias: bool = False,
-                 device: Optional[torch.device] = None, use_buffers: bool = True):
+                 device: Optional[torch.device] = None):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self._use_buffers = use_buffers
 
-        # bf16 parameter — optimizer updates this
         self.weight = nn.Parameter(
             torch.empty(out_features, in_features, device=device, dtype=torch.bfloat16)
         )
@@ -198,84 +194,32 @@ class FP8PureLinear(nn.Module):
         else:
             self.bias = None
 
-        if use_buffers:
-            # Persistent fp8 storage (single GPU / DDP only)
-            self.register_buffer('_weight_fp8',
-                                 torch.zeros(out_features, in_features, device=device, dtype=torch.float8_e4m3fn))
-            self.register_buffer('_weight_scale',
-                                 torch.ones(1, device=device, dtype=torch.float32))
-            self._compressed = False
-        else:
-            # No buffers — ZeRO-3/FSDP mode, quantize on-the-fly
-            self._weight_fp8 = None
-            self._weight_scale = None
-            self._compressed = False
-
     @classmethod
-    def from_linear(cls, linear: nn.Linear, use_buffers: bool = True) -> "FP8PureLinear":
+    def from_linear(cls, linear: nn.Linear) -> "FP8PureLinear":
         """Create FP8PureLinear from an existing nn.Linear."""
         has_bias = linear.bias is not None
         fp8_mod = cls(linear.in_features, linear.out_features, bias=has_bias,
-                      device=linear.weight.device, use_buffers=use_buffers)
+                      device=linear.weight.device)
         fp8_mod.weight = linear.weight
         if has_bias:
             fp8_mod.bias = linear.bias
-
-        if use_buffers:
-            # Tag for fused optimizer
-            fp8_mod.weight._fp8_ref = (fp8_mod, '_weight_fp8', '_weight_scale')
-            fp8_mod.compress()
-
         return fp8_mod
 
-    def compress(self):
-        """Quantize bf16 weight to fp8, free bf16. Only in buffered mode."""
-        if not self._use_buffers or self._compressed:
-            return
-        w = self.weight.data
-        if w.numel() == 0:
-            return
-        fp8_data, scale = _quantize_e4m3(w)
-        self._weight_fp8.copy_(fp8_data)
-        self._weight_scale.copy_(scale)
-        self.weight.data = torch.empty(0, device=w.device, dtype=w.dtype)
-        self._compressed = True
-
-    def materialize(self):
-        """Decompress fp8 to bf16. Only in buffered mode."""
-        if not self._use_buffers or not self._compressed:
-            return
-        self.weight.data = self._weight_fp8.to(torch.bfloat16) * self._weight_scale.to(torch.bfloat16)
-        self._compressed = False
-
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        """Forward using native fp8 matmul.
+        """Forward using native fp8 matmul with STE gradient routing.
 
-        In buffered mode: uses pre-compressed fp8 weight, routes gradients
-        through self.weight via STE (straight-through estimator).
-        In on-the-fly mode: quantizes the (gathered) bf16 weight each forward.
+        Quantizes bf16 weight to fp8 on-the-fly each forward. Gradients
+        flow through self.weight via straight-through estimator.
         """
-        if self._use_buffers:
-            if not self._compressed:
-                self.compress()
-            # Pass self.weight as proxy for gradient routing (STE)
-            output = _FP8MatmulFunction.apply(
-                input, self.weight, self._weight_fp8, self._weight_scale, self.bias
-            )
-            return output
-        else:
-            # On-the-fly: self.weight is bf16 (gathered by ZeRO-3 during forward)
-            weight_fp8, weight_scale = _quantize_e4m3(self.weight)
-            output = _FP8MatmulFunction.apply(
-                input, self.weight, weight_fp8, weight_scale, self.bias
-            )
-            return output
+        weight_fp8, weight_scale = _quantize_e4m3(self.weight)
+        return _FP8MatmulFunction.apply(
+            input, self.weight, weight_fp8, weight_scale, self.bias
+        )
 
     def extra_repr(self) -> str:
-        mode = "buffered" if self._use_buffers else "on-the-fly"
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, "
-            f"bias={self.bias is not None}, mode=pure_fp8({mode})"
+            f"bias={self.bias is not None}, mode=pure_fp8(on-the-fly)"
         )
 
 
@@ -315,8 +259,7 @@ def _detect_zero3() -> bool:
 
 
 def convert_model_to_fp8_pure(model: nn.Module, skip_vision_tower: bool = True,
-                               min_numel: int = 1024, require_alignment: int = 16,
-                               force_buffers: Optional[bool] = None) -> nn.Module:
+                               min_numel: int = 1024, require_alignment: int = 16) -> nn.Module:
     """Replace nn.Linear modules with FP8PureLinear for native fp8 matmul.
 
     Args:
@@ -324,8 +267,8 @@ def convert_model_to_fp8_pure(model: nn.Module, skip_vision_tower: bool = True,
         skip_vision_tower: Skip vision tower modules.
         min_numel: Minimum parameter count for conversion.
         require_alignment: Required dimension alignment.
-        force_buffers: Override buffer mode. None = auto-detect (no buffers for ZeRO-3/FSDP).
 
+    Uses on-the-fly quantization (bf16 weights quantized to fp8 each forward).
     Falls back to storage mode on GPUs without native fp8 matmul support.
     """
     if not _check_native_fp8_support():
@@ -338,13 +281,9 @@ def convert_model_to_fp8_pure(model: nn.Module, skip_vision_tower: bool = True,
         return convert_model_to_fp8_storage(model, skip_vision_tower=skip_vision_tower,
                                              min_numel=min_numel, require_alignment=require_alignment)
 
-    # Auto-detect: skip buffers for ZeRO-3/FSDP (they shard Parameters, not buffers)
-    if force_buffers is not None:
-        use_buffers = force_buffers
-    else:
-        use_buffers = not _detect_zero3()
-
-    mode_str = "buffered" if use_buffers else "on-the-fly (ZeRO-3/FSDP detected)"
+    mode_str = "on-the-fly"
+    if _detect_zero3():
+        mode_str += " (ZeRO-3/FSDP detected)"
     logger.info_rank0(f"FP8 pure mode: using {mode_str} weight quantization.")
 
     converted = 0
@@ -375,7 +314,7 @@ def convert_model_to_fp8_pure(model: nn.Module, skip_vision_tower: bool = True,
                 skipped += 1
                 continue
 
-            fp8_mod = FP8PureLinear.from_linear(child, use_buffers=use_buffers)
+            fp8_mod = FP8PureLinear.from_linear(child)
             replacements.append((module, child_name, fp8_mod))
             converted += 1
 
@@ -389,15 +328,3 @@ def convert_model_to_fp8_pure(model: nn.Module, skip_vision_tower: bool = True,
     return model
 
 
-def fp8_pure_compress_all(model: nn.Module) -> None:
-    """Compress all FP8PureLinear weights. Only affects buffered mode."""
-    for module in model.modules():
-        if isinstance(module, FP8PureLinear):
-            module.compress()
-
-
-def fp8_pure_materialize_all(model: nn.Module) -> None:
-    """Materialize all FP8PureLinear weights to bf16. Only affects buffered mode."""
-    for module in model.modules():
-        if isinstance(module, FP8PureLinear):
-            module.materialize()
