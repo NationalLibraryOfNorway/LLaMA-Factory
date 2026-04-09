@@ -229,11 +229,13 @@ class FP8StorageExperts(nn.Module):
         self._compressed = False
 
         # Create fp8 storage buffers for each expert parameter
+        # Use ds_shape if available (ZeRO-3 flattens params to 1D shards)
         for name in expert_param_names:
             param = getattr(experts_module, name)
+            shape = getattr(param, 'ds_shape', param.shape)
             self.register_buffer(
                 f'_fp8_{name}',
-                torch.zeros(param.shape, device=param.device, dtype=torch.float8_e4m3fn),
+                torch.zeros(shape, device=param.device, dtype=torch.float8_e4m3fn),
             )
             self.register_buffer(
                 f'_scale_{name}',
@@ -248,7 +250,10 @@ class FP8StorageExperts(nn.Module):
         """
         param_names = []
         for name, param in experts_module.named_parameters(recurse=False):
-            if param.dim() >= 3 and param.numel() >= 1024:
+            # With ZeRO-3, param is a 1D shard. Use ds_shape if available.
+            shape = getattr(param, 'ds_shape', param.shape)
+            numel = shape.numel() if hasattr(shape, 'numel') else param.numel()
+            if len(shape) >= 3 and numel >= 1024:
                 param_names.append(name)
 
         if not param_names:
@@ -462,8 +467,11 @@ def _is_expert_module(name: str, module: nn.Module) -> bool:
         return False
 
     # Verify it has 3D parameters (the hallmark of expert weight storage)
+    # With ZeRO-3, param.dim() may be 1 (flattened shard), so also check ds_shape
     for param_name, param in module.named_parameters(recurse=False):
-        if param.dim() >= 3 and param.numel() >= 1024:
+        shape = getattr(param, 'ds_shape', param.shape)
+        numel = shape.numel() if hasattr(shape, 'numel') else param.numel()
+        if len(shape) >= 3 and numel >= 1024:
             return True
 
     return False
