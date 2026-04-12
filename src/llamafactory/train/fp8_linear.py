@@ -189,25 +189,28 @@ class FP8StorageLinear(nn.Module):
             if w.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
                 # FP8-native checkpoint: weight tensor is already fp8
                 if ext_scale_key in state_dict:
-                    # Scale provided — load fp8 data + scale directly, no casting
-                    state_dict[fp8_key] = w.to(torch.float8_e4m3fn)
-                    state_dict[scale_key] = state_dict.pop(ext_scale_key).to(torch.float32)
+                    scale = state_dict.pop(ext_scale_key).to(torch.float32)
                 elif scale_key in state_dict:
-                    # Our own buffer scale key is present
-                    state_dict[fp8_key] = w.to(torch.float8_e4m3fn)
+                    scale = state_dict[scale_key].to(torch.float32)
                 else:
                     # No scale found — round-trip through bf16 to compute one
-                    fp8_data, scale = quantize_to_fp8(w.to(torch.bfloat16), dtype=torch.float8_e4m3fn)
-                    state_dict[fp8_key] = fp8_data
-                    state_dict[scale_key] = scale
-                # Replace weight with empty tensor so Parameter stays bf16
-                state_dict[weight_key] = torch.empty(0, dtype=self.weight.dtype)
-                super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
+                    _, scale = quantize_to_fp8(w.to(torch.bfloat16), dtype=torch.float8_e4m3fn)
+                # Load fp8 data directly into buffers, bypass super() shape checks
+                self._weight_fp8.copy_(w.to(torch.float8_e4m3fn))
+                self._weight_scale.copy_(scale)
+                self.weight.data = torch.empty(0, device=self.weight.device, dtype=self.weight.dtype)
+                if self.bias is not None and (prefix + "bias") in state_dict:
+                    self.bias.data.copy_(state_dict[prefix + "bias"])
                 self._compressed = True
                 return
             elif w.numel() == 0 and fp8_key in state_dict:
                 # Compressed checkpoint: weight is empty, fp8 buffers have data
-                super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
+                self._weight_fp8.copy_(state_dict[fp8_key])
+                if scale_key in state_dict:
+                    self._weight_scale.copy_(state_dict[scale_key])
+                self.weight.data = torch.empty(0, device=self.weight.device, dtype=self.weight.dtype)
+                if self.bias is not None and (prefix + "bias") in state_dict:
+                    self.bias.data.copy_(state_dict[prefix + "bias"])
                 self._compressed = True
                 return
 
@@ -579,7 +582,8 @@ def _is_expert_module(name: str, module: nn.Module) -> bool:
 
 def convert_model_to_fp8_storage(model: nn.Module, skip_vision_tower: bool = True,
                                   min_numel: int = 1024, require_alignment: int = 16,
-                                  fp8_gradients: bool = True) -> nn.Module:
+                                  fp8_gradients: bool = True,
+                                  fp8_mode: str = "auto") -> nn.Module:
     """Convert model to use FP8 weight storage for memory-efficient training.
 
     Handles two module types:
@@ -592,12 +596,28 @@ def convert_model_to_fp8_storage(model: nn.Module, skip_vision_tower: bool = Tru
         min_numel: Minimum parameter count for linear layer conversion.
         require_alignment: Required dimension alignment for linear layers (0 to disable).
         fp8_gradients: If True, also install fp8 gradient compression hooks.
+        fp8_mode: One of "auto", "storage", "native".
+            "storage": bf16 compute only (use_native_fp8=False).
+            "native": require native fp8 matmul (error if GPU < sm89).
+            "auto": auto-detect GPU capability.
 
     Returns:
         The model with eligible modules converted to FP8 storage.
     """
     from .fp8_pure import _check_native_fp8_support, _detect_zero3
-    use_native_fp8 = _check_native_fp8_support() and not _detect_zero3()
+
+    if fp8_mode == "storage":
+        use_native_fp8 = False
+    elif fp8_mode == "native":
+        if not _check_native_fp8_support():
+            cc = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
+            raise RuntimeError(
+                f"fp8_mode='native' requires compute capability >= 8.9 "
+                f"(Ada Lovelace or Hopper). Current GPU: {cc[0]}.{cc[1]}"
+            )
+        use_native_fp8 = not _detect_zero3()
+    else:  # "auto"
+        use_native_fp8 = _check_native_fp8_support() and not _detect_zero3()
 
     linear_converted = 0
     linear_skipped = 0
@@ -742,3 +762,54 @@ class FP8StorageCallback(TrainerCallback):
     def on_save(self, args, state, control, model=None, **kwargs):
         """No-op: _save_to_state_dict handles fp8-native checkpoint format."""
         pass
+
+
+# ---------------------------------------------------------------------------
+# Workflow helper
+# ---------------------------------------------------------------------------
+
+def setup_fp8_training(
+    model: nn.Module,
+    training_args: "TrainingArguments",
+    finetuning_args,
+    callbacks: Optional[list] = None,
+) -> tuple[nn.Module, Optional[list], Optional[torch.optim.Optimizer]]:
+    """Apply FP8 training if configured.
+
+    Centralizes the FP8 setup logic shared across SFT/PT/DPO workflows.
+
+    Returns:
+        (model, callbacks, fused_optimizer_or_None)
+    """
+    if not getattr(training_args, "fp8", False) or not training_args.do_train:
+        return model, callbacks, None
+
+    fp8_mode = getattr(training_args, "fp8_mode", "auto")
+    if fp8_mode == "accelerate":
+        return model, callbacks, None  # Accelerate path handles everything
+
+    skip_vision = getattr(finetuning_args, "freeze_vision_tower", True)
+    use_fused = "adafactor" in getattr(training_args, "optim", "")
+
+    from .fp8_pure import _detect_zero3
+    if _detect_zero3():
+        logger.warning_rank0(
+            "FP8 storage mode is incompatible with ZeRO-3 (buffers are not "
+            "partitioned). Skipping FP8 weight storage. FP8 gradient hooks "
+            "and fused optimizer will still be applied if configured."
+        )
+    else:
+        model = convert_model_to_fp8_storage(
+            model, skip_vision_tower=skip_vision, fp8_mode=fp8_mode
+        )
+
+    if callbacks is None:
+        callbacks = []
+    callbacks.append(FP8StorageCallback(fused_optimizer=use_fused))
+
+    fused_optim = None
+    if use_fused:
+        from .fp8_optim import create_fp8_adafactor
+        fused_optim = create_fp8_adafactor(model, training_args)
+
+    return model, callbacks, fused_optim

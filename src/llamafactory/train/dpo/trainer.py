@@ -60,6 +60,15 @@ class CustomDPOTrainer(DPOTrainer):
                 disable_dropout_in_model(ref_model)
 
         self.finetuning_args = finetuning_args
+
+        # Configure FP8 Accelerate environment (only for accelerate mode)
+        training_args = kwargs.get("args")
+        if getattr(training_args, "fp8", False) and getattr(training_args, "fp8_mode", "auto") == "accelerate":
+            from ..fp8_utils import configure_fp8_environment, patch_accelerator_for_fp8
+            configure_fp8_environment(training_args)
+            if getattr(training_args, "fp8_backend", "auto") == "te":
+                patch_accelerator_for_fp8()
+
         self.f_divergence_type = "reverse_kl"
         self.reference_free = False
         self.use_dpo_data_collator = True  # hack to avoid warning

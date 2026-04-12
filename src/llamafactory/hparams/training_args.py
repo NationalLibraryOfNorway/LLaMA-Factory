@@ -74,10 +74,20 @@ class Fp8Arguments:
             "Requires PyTorch 2.7+ and Hopper architecture GPUs."
         },
     )
+    fp8_mode: str = field(
+        default="auto",
+        metadata={
+            "help": "FP8 operating mode. 'auto': fp8 storage + native matmul on supported GPUs. "
+                    "'storage': fp8 storage only, bf16 compute. "
+                    "'native': fp8 storage + require native matmul (error on older GPUs). "
+                    "'accelerate': delegate to HuggingFace Accelerate (torchao/TE), no custom modules."
+        },
+    )
     fp8_backend: str = field(
         default="auto",
         metadata={
-            "help": "FP8 backend to use ('auto', 'torchao', 'te', 'msamp'). 'auto' selects best available backend."
+            "help": "FP8 backend for 'accelerate' mode ('auto', 'torchao', 'te', 'msamp'). "
+                    "'auto' selects best available backend."
         },
     )
     fp8_enable_fsdp_float8_all_gather: bool = field(

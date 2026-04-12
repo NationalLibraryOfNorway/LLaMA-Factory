@@ -55,31 +55,10 @@ def run_sft(
     model = load_model(tokenizer, model_args, finetuning_args, training_args.do_train)
 
     # Apply FP8 training mode if requested.
-    # Converts model weights to fp8 storage (1 byte/param). On Ada/Hopper GPUs,
-    # also uses native fp8 matmul (torch._scaled_mm) for compute speedup.
-    fp8_fused_optim = None
-    if training_args.fp8 and training_args.do_train:
-        skip_vision = getattr(finetuning_args, "freeze_vision_tower", True)
-        use_fused = "adafactor" in getattr(training_args, "optim", "")
-
-        from ..fp8_pure import _detect_zero3
-        if _detect_zero3():
-            logger.warning_rank0(
-                "FP8 storage mode is incompatible with ZeRO-3 (buffers are not "
-                "partitioned). Skipping FP8 weight storage. FP8 gradient hooks "
-                "and fused optimizer will still be applied if configured."
-            )
-        else:
-            from ..fp8_linear import convert_model_to_fp8_storage
-            model = convert_model_to_fp8_storage(model, skip_vision_tower=skip_vision)
-
-        from ..fp8_linear import FP8StorageCallback
-        if callbacks is None:
-            callbacks = []
-        callbacks.append(FP8StorageCallback(fused_optimizer=use_fused))
-        if use_fused:
-            from ..fp8_optim import create_fp8_adafactor
-            fp8_fused_optim = create_fp8_adafactor(model, training_args)
+    from ..fp8_linear import setup_fp8_training
+    model, callbacks, fp8_fused_optim = setup_fp8_training(
+        model, training_args, finetuning_args, callbacks
+    )
 
     ref_model = None
     if finetuning_args.use_asft_loss:
