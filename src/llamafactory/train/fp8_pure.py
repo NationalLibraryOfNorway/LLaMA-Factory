@@ -144,10 +144,20 @@ class _FP8MatmulFunction(Function):
         grad_input = grad_input_2d.reshape(ctx.orig_shape)
 
         # grad_weight = grad_output^T @ input  (N,M) @ (M,K) = (N,K)
+        # M (batch tokens) may not be 16-aligned; pad if needed for _scaled_mm
+        M = grad_fp8.shape[0]
+        pad_m = (16 - M % 16) % 16
+        if pad_m > 0:
+            grad_fp8_padded = torch.nn.functional.pad(grad_fp8, (0, 0, 0, pad_m))
+            input_fp8_padded = torch.nn.functional.pad(input_fp8, (0, 0, 0, pad_m))
+        else:
+            grad_fp8_padded = grad_fp8
+            input_fp8_padded = input_fp8
+
         # B must be column-major: .t().contiguous().t() makes (M,K) col-major
         grad_weight = torch._scaled_mm(
-            grad_fp8.t().contiguous(),
-            input_fp8.t().contiguous().t(),
+            grad_fp8_padded.t().contiguous(),
+            input_fp8_padded.t().contiguous().t(),
             scale_a=grad_scale,
             scale_b=input_scale,
             out_dtype=torch.bfloat16,
