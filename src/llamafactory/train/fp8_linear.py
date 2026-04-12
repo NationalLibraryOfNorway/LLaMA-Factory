@@ -430,17 +430,16 @@ def _make_fp8_grad_hook(param: nn.Parameter):
     """Create a post-accumulate gradient hook that compresses gradients to fp8_e5m2.
 
     The hook fires after each backward pass (including each micro-batch in gradient
-    accumulation). For grad_accum > 1, it accumulates in fp8 via dequant-add-requant:
+    accumulation). Accumulates in bf16 during micro-batches, compresses to fp8 after
+    each accumulation to free memory:
 
-      1. First micro-batch: grad is fresh → compress to fp8, store as _grad_fp8/_grad_scale
-      2. Subsequent micro-batches: dequant previous fp8 accumulator, add new bf16 grad,
-         requant back to fp8. PyTorch sets param.grad = new_grad (not accumulated) because
-         we null it after each hook, so we manually accumulate with the fp8 buffer.
+      1. First micro-batch: store bf16 grad directly
+      2. Subsequent micro-batches: accumulate in bf16 (one add, no quantization)
+      3. After each micro-batch: compress accumulated bf16 to fp8, free bf16
 
-    Error analysis: e5m2 has ~0.5% relative quantization error per step. Over N accumulation
-    steps, the error grows as ~sqrt(N) * 0.5% (errors are uncorrelated across micro-batches).
-    For grad_accum=4: ~1% error. For grad_accum=8: ~1.4% error. Stochastic gradient noise
-    is typically 10-50%, so this is well within tolerance.
+    This avoids the expensive dequant-add-requant cycle on every micro-batch.
+    The single quantization per accumulation step has ~0.5% relative error (e5m2),
+    well within stochastic gradient noise (10-50%).
     """
     def hook(param: nn.Parameter):
         if param.grad is None:
@@ -449,10 +448,10 @@ def _make_fp8_grad_hook(param: nn.Parameter):
         new_grad = param.grad.detach()
 
         if hasattr(param, '_grad_fp8') and param._grad_fp8 is not None:
-            # Accumulate: dequant previous + add new + requant
+            # Accumulate: dequant previous fp8 + add new bf16 + requant
             prev = dequantize_from_fp8(param._grad_fp8, param._grad_scale, dtype=new_grad.dtype)
-            accumulated = prev + new_grad
-            fp8_grad, scale = quantize_to_fp8(accumulated, dtype=torch.float8_e5m2)
+            prev.add_(new_grad)  # in-place accumulate
+            fp8_grad, scale = quantize_to_fp8(prev, dtype=torch.float8_e5m2)
         else:
             # First micro-batch: just compress
             fp8_grad, scale = quantize_to_fp8(new_grad, dtype=torch.float8_e5m2)
