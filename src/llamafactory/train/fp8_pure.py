@@ -103,14 +103,12 @@ class _FP8MatmulFunction(Function):
         # Quantize input to e4m3
         input_fp8, input_scale = _quantize_e4m3(input_2d)
 
-        # Pre-compute column-major weight for backward (reused for both grad matmuls)
-        weight_col_major = weight_fp8.t().contiguous()
-
-        # scaled_mm: (M, K) @ (K, N) → (M, N)
+        # Forward: output = input @ weight^T = (M, K) @ (K, N)
+        # weight_fp8 is (N, K) contiguous; .t() gives (K, N) column-major — no copy.
         # use_fast_accum trades ~0.1% accuracy for higher throughput on Hopper
         output_2d = _scaled_mm(
             input_fp8,
-            weight_col_major.t(),
+            weight_fp8.t(),
             scale_a=input_scale,
             scale_b=weight_scale,
             out_dtype=torch.bfloat16,
@@ -121,8 +119,11 @@ class _FP8MatmulFunction(Function):
         out_features = output_2d.shape[-1]
         output = output_2d.reshape(*orig_shape[:-1], out_features)
 
+        # Pre-compute (K, N) row-major for backward: .t() gives (N, K) column-major,
+        # which is what _scaled_mm needs for grad_input = grad_output @ weight.
+        weight_col_major = weight_fp8.t().contiguous()
+
         # Save fp8 tensors for backward (1 byte each, not bf16)
-        # Cache column-major weight to avoid recomputing in backward
         ctx.save_for_backward(input_fp8, input_scale, weight_fp8, weight_scale, weight_col_major)
         ctx.has_bias = bias is not None
         ctx.orig_shape = orig_shape

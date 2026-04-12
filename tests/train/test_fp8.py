@@ -241,6 +241,34 @@ def test_fp8_native_gradient_flow():
     not torch.cuda.is_available() or not _check_native_fp8_support(),
     reason="Requires native FP8 support (sm_89+)",
 )
+def test_fp8_native_nonsquare_weights():
+    """Test native fp8 matmul with non-square weight matrices.
+
+    Regression test: the forward pass double-transpose bug only manifested
+    with non-square weights (e.g., in_features != out_features).
+    """
+    device = torch.device("cuda:0")
+    # Test both wide and tall weight matrices
+    for in_f, out_f in [(2816, 4096), (4096, 2816), (1024, 256), (256, 1024)]:
+        linear = nn.Linear(in_f, out_f, bias=False).to(device, dtype=torch.bfloat16)
+        fp8_linear = FP8StorageLinear.from_linear(linear, use_native_fp8=True)
+
+        input_tensor = torch.randn(16, in_f, dtype=torch.bfloat16, device=device, requires_grad=True)
+        output = fp8_linear(input_tensor)
+
+        assert output.shape == (16, out_f), f"Shape mismatch for ({in_f}, {out_f})"
+        assert output.dtype == torch.bfloat16
+
+        loss = output.sum()
+        loss.backward()
+        assert input_tensor.grad is not None
+        assert input_tensor.grad.shape == (16, in_f)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _check_native_fp8_support(),
+    reason="Requires native FP8 support (sm_89+)",
+)
 def test_fp8_native_matmul_speedup():
     """Benchmark: native fp8 scaled_mm should be faster than bf16 matmul.
 
