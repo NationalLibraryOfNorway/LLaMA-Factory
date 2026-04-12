@@ -57,9 +57,9 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         **kwargs,
     ) -> None:
         kwargs["processing_class"] = kwargs.pop("tokenizer")
-        # Configure FP8 environment if enabled
+        # Configure FP8 Accelerate environment (only for accelerate mode)
         training_args: TrainingArguments = kwargs.get("args")
-        if training_args.fp8:
+        if training_args.fp8 and getattr(training_args, "fp8_mode", "auto") == "accelerate":
             configure_fp8_environment(training_args)
             if getattr(training_args, "fp8_backend", "auto") == "te":
                 patch_accelerator_for_fp8()
@@ -124,7 +124,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 asft_alpha=finetuning_args.asft_alpha,
             )
 
-        if training_args.fp8 and hasattr(self, "accelerator"):  # verify FP8 status after trainer initialization
+        if training_args.fp8 and getattr(training_args, "fp8_mode", "auto") == "accelerate" and hasattr(self, "accelerator"):
             verify_fp8_status(self.accelerator, training_args)
 
     @override

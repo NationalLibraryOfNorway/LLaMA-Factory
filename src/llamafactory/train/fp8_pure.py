@@ -13,41 +13,30 @@
 # limitations under the License.
 
 """
-Pure FP8 training with native scaled_mm matmul (Ada/Hopper GPUs).
+Native FP8 matmul kernel for Ada/Hopper GPUs.
 
-Two operating modes depending on distributed strategy:
+Provides _FP8MatmulFunction, a custom autograd function that performs
+forward and backward matmul using torch._scaled_mm with fp8 tensor cores.
 
-Single GPU / DDP (no weight sharding):
-  - Weights stored persistently in fp8 buffers (1B/param)
-  - Forward/backward use pre-quantized fp8 weights → maximum speed
-  - Compress/materialize lifecycle managed by FP8StorageCallback
+Used by FP8StorageLinear (in fp8_linear.py) when use_native_fp8=True.
+Not a standalone module -- always paired with fp8 storage lifecycle.
 
-DeepSpeed ZeRO-3 / FSDP (weight sharding):
-  - No persistent fp8 buffers (would be unpartitioned full copies = worse memory)
-  - Weights stay as bf16 nn.Parameters (partitioned by ZeRO-3 / FSDP)
-  - On-the-fly quantization to fp8 during forward (after ZeRO-3 gathers weight)
-  - Still get ~2x matmul speedup from native fp8 tensor cores
-  - ZeRO-3 handles memory efficiency; we handle compute efficiency
+Matmul operations:
+  Forward:  output    = scaled_mm(input_e4m3, weight_e4m3^T) -> bf16
+  Backward: grad_input  = scaled_mm(grad_e5m2, weight_e4m3)
+            grad_weight = scaled_mm(input_e4m3^T, grad_e5m2)
 
-In both modes:
-  - Forward: weight (e4m3) × input (e4m3) via scaled_mm → bf16 output
-  - Backward dL/dX: grad_output (e5m2) × weight^T (e4m3) via scaled_mm
-  - Backward dL/dW: input^T (e4m3) × grad_output (e5m2) via scaled_mm
+All three use hardware fp8 tensor cores for ~2x throughput.
+Requires CUDA compute capability >= 8.9 (Ada Lovelace / Hopper).
 
-All three matmul operations use hardware fp8 tensor cores for ~2x throughput.
-Requires CUDA compute capability >= 8.9 (Ada Lovelace) or >= 9.0 (Hopper).
-
-Precision notes:
-  - Accumulation in scaled_mm is fp32 internally on Hopper (TMA), bf16 on Ada.
-  - LayerNorm, Softmax, embedding, and lm_head remain in bf16 (precision-critical).
-  - Only nn.Linear matmul operations are replaced with fp8.
-  - Optimizer step still happens in fp32 (via FP8Adafactor or standard optimizer).
+Also provides utility functions:
+  _check_native_fp8_support() -- GPU capability check
+  _detect_zero3() -- DeepSpeed ZeRO-3 / FSDP detection
 """
 
 from typing import Optional
 
 import torch
-import torch.nn as nn
 from torch.autograd import Function
 
 from ..extras import logging
@@ -181,6 +170,9 @@ class _FP8MatmulFunction(Function):
                 param._grad_scale = scale
                 param.grad = None  # Free any bf16 grad if created
             else:
+                # When weight is compressed (empty), materialize before setting grad
+                if hasattr(module, "_compressed") and module._compressed:
+                    module.materialize()
                 if param.grad is not None:
                     param.grad.add_(grad_weight)
                 else:
@@ -188,68 +180,6 @@ class _FP8MatmulFunction(Function):
 
         # Returns: grad_input, grad_weight_proxy (None), grad_weight_fp8, grad_scale, grad_bias, module
         return grad_input, None, None, None, grad_bias, None
-
-
-class FP8PureLinear(nn.Module):
-    """Linear layer using native fp8 matmul for maximum throughput.
-
-    Weight stays as bf16 nn.Parameter (optimizer updates it, gradients flow
-    through it via STE). Each forward quantizes weight to fp8 on-the-fly for
-    torch._scaled_mm. FP8 gradient compression hooks (installed separately)
-    reduce gradient memory by ~50%.
-
-    Requires CUDA compute capability >= 8.9 (Ada Lovelace / RTX 4090+).
-    """
-
-    def __init__(self, in_features: int, out_features: int, bias: bool = False,
-                 device: Optional[torch.device] = None):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-
-        self.weight = nn.Parameter(
-            torch.empty(out_features, in_features, device=device, dtype=torch.bfloat16)
-        )
-        if bias:
-            self.bias = nn.Parameter(torch.zeros(out_features, device=device, dtype=torch.bfloat16))
-        else:
-            self.bias = None
-
-    @classmethod
-    def from_linear(cls, linear: nn.Linear) -> "FP8PureLinear":
-        """Create FP8PureLinear from an existing nn.Linear."""
-        has_bias = linear.bias is not None
-        fp8_mod = cls(linear.in_features, linear.out_features, bias=has_bias,
-                      device=linear.weight.device)
-        fp8_mod.weight = linear.weight
-        if has_bias:
-            fp8_mod.bias = linear.bias
-        return fp8_mod
-
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        """Forward using native fp8 matmul with STE gradient routing.
-
-        Quantizes bf16 weight to fp8 on-the-fly each forward. Gradients
-        flow through self.weight via straight-through estimator.
-        """
-        weight_fp8, weight_scale = _quantize_e4m3(self.weight)
-        return _FP8MatmulFunction.apply(
-            input, self.weight, weight_fp8, weight_scale, self.bias
-        )
-
-    def extra_repr(self) -> str:
-        return (
-            f"in_features={self.in_features}, out_features={self.out_features}, "
-            f"bias={self.bias is not None}, mode=pure_fp8(on-the-fly)"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Model conversion
-# ---------------------------------------------------------------------------
-
-_SKIP_MODULES = {"lm_head", "embed_tokens", "embed_positions", "wte", "wpe",
-                 "embed_vision", "embedding_projection"}
 
 
 def _detect_zero3() -> bool:
@@ -277,75 +207,5 @@ def _detect_zero3() -> bool:
         return True
 
     return False
-
-
-def convert_model_to_fp8_pure(model: nn.Module, skip_vision_tower: bool = True,
-                               min_numel: int = 1024, require_alignment: int = 16) -> nn.Module:
-    """Replace nn.Linear modules with FP8PureLinear for native fp8 matmul.
-
-    Args:
-        model: Model to convert.
-        skip_vision_tower: Skip vision tower modules.
-        min_numel: Minimum parameter count for conversion.
-        require_alignment: Required dimension alignment.
-
-    Uses on-the-fly quantization (bf16 weights quantized to fp8 each forward).
-    Falls back to storage mode on GPUs without native fp8 matmul support.
-    """
-    if not _check_native_fp8_support():
-        cc = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
-        logger.warning_rank0(
-            f"GPU compute capability {cc} < 8.9: native fp8 matmul not supported. "
-            f"Falling back to fp8 storage mode (memory savings only, no compute speedup)."
-        )
-        from .fp8_linear import convert_model_to_fp8_storage
-        return convert_model_to_fp8_storage(model, skip_vision_tower=skip_vision_tower,
-                                             min_numel=min_numel, require_alignment=require_alignment)
-
-    mode_str = "on-the-fly"
-    if _detect_zero3():
-        mode_str += " (ZeRO-3/FSDP detected)"
-    logger.info_rank0(f"FP8 pure mode: using {mode_str} weight quantization.")
-
-    converted = 0
-    skipped = 0
-    replacements = []
-
-    for name, module in model.named_modules():
-        if skip_vision_tower and any(vt in name for vt in ("vision_tower", "vision_model", "visual")):
-            continue
-
-        for child_name, child in module.named_children():
-            full_name = f"{name}.{child_name}" if name else child_name
-            if not isinstance(child, nn.Linear):
-                continue
-
-            parts = full_name.split(".")
-            if any(skip in part for skip in _SKIP_MODULES for part in parts):
-                skipped += 1
-                continue
-            # Use module attributes (not weight.numel()) because ZeRO-3 partitions
-            # weight tensors into 1D shards, making numel() return the shard size
-            real_numel = child.in_features * child.out_features
-            if real_numel < min_numel:
-                skipped += 1
-                continue
-            if require_alignment > 0 and (child.in_features % require_alignment != 0
-                                          or child.out_features % require_alignment != 0):
-                skipped += 1
-                continue
-
-            fp8_mod = FP8PureLinear.from_linear(child)
-            replacements.append((module, child_name, fp8_mod))
-            converted += 1
-
-    for parent, child_name, fp8_mod in replacements:
-        setattr(parent, child_name, fp8_mod)
-
-    logger.info_rank0(
-        f"FP8 pure mode: converted {converted} linear layers, skipped {skipped}. "
-        f"Mode: {mode_str}."
-    )
-    return model
 
 
