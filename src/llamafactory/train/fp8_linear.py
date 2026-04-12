@@ -83,12 +83,16 @@ _E5M2_MAX = torch.finfo(torch.float8_e5m2).max
 
 
 def quantize_to_fp8(tensor: torch.Tensor,
-                    dtype: torch.dtype = torch.float8_e4m3fn) -> tuple[torch.Tensor, torch.Tensor]:
+                    dtype: torch.dtype = torch.float8_e4m3fn,
+                    out: Optional[torch.Tensor] = None,
+                    out_scale: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize a bf16/fp32 tensor to fp8 with per-tensor dynamic scaling.
 
     Args:
         tensor: Input tensor in bf16 or fp32.
         dtype: Target fp8 dtype. Use float8_e4m3fn for weights, float8_e5m2 for gradients.
+        out: Optional pre-allocated fp8 buffer to write into (avoids allocation).
+        out_scale: Optional pre-allocated scale buffer to write into.
 
     Returns:
         (fp8_tensor, scale) where original ≈ fp8_tensor.to(bf16) * scale
@@ -98,6 +102,11 @@ def quantize_to_fp8(tensor: torch.Tensor,
     scale = amax / fp8_max
     scale = scale.clamp(min=1e-12)  # avoid division by zero
     fp8_tensor = (tensor / scale).to(dtype)
+    if out is not None:
+        out.copy_(fp8_tensor)
+        if out_scale is not None:
+            out_scale.copy_(scale)
+        return out, out_scale if out_scale is not None else scale
     return fp8_tensor, scale
 
 
@@ -226,9 +235,9 @@ class FP8StorageLinear(nn.Module):
         if w.numel() == 0:
             return
 
-        fp8_data, scale = quantize_to_fp8(w, dtype=torch.float8_e4m3fn)
-        self._weight_fp8.copy_(fp8_data)
-        self._weight_scale.copy_(scale)
+        # Quantize directly into pre-allocated buffers (no temporary allocation)
+        quantize_to_fp8(w, dtype=torch.float8_e4m3fn,
+                        out=self._weight_fp8, out_scale=self._weight_scale)
 
         # Free bf16 weight data by replacing with empty tensor
         self.weight.data = torch.empty(0, device=w.device, dtype=w.dtype)
@@ -371,9 +380,9 @@ class FP8StorageExperts(nn.Module):
             param = getattr(self._inner, name)
             if param.data.numel() == 0:
                 continue
-            fp8_data, scale = quantize_to_fp8(param.data, dtype=torch.float8_e4m3fn)
-            getattr(self, f'_fp8_{name}').copy_(fp8_data)
-            getattr(self, f'_scale_{name}').copy_(scale)
+            quantize_to_fp8(param.data, dtype=torch.float8_e4m3fn,
+                            out=getattr(self, f'_fp8_{name}'),
+                            out_scale=getattr(self, f'_scale_{name}'))
             param.data = torch.empty(0, device=param.device, dtype=param.dtype)
 
         self._compressed = True
@@ -724,17 +733,33 @@ class FP8StorageCallback(TrainerCallback):
       4. FP8Adafactor.step(): reads fp8, updates in fp32, writes fp8
       5. on_step_end: SKIP compress (already fp8), just clear grad accumulators
       6. on_save: no-op (save fp8 buffers directly, _load_from_state_dict handles loading)
+
+    Metrics (logged on each logging step):
+      - fp8_weight_quant_error: mean relative error from weight fp8 round-trip
+      - fp8_memory_saved_mb: estimated memory saved by fp8 storage + gradients
+      - fp8_layers_converted: number of FP8-managed layers
     """
 
     def __init__(self, fp8_gradients: bool = True, fused_optimizer: bool = False):
         self._fp8_gradients = fp8_gradients
         self._fused_optimizer = fused_optimizer
         self._model = None
+        self._fp8_layer_count = 0
+        self._fp8_param_count = 0
 
     def on_train_begin(self, args, state, control, model=None, **kwargs):
         """Ensure weights start compressed and store model reference."""
         if model is not None:
             self._model = model
+            # Count FP8-managed layers and parameters for metrics
+            for module in model.modules():
+                if isinstance(module, FP8StorageLinear):
+                    self._fp8_layer_count += 1
+                    self._fp8_param_count += module.in_features * module.out_features
+                elif isinstance(module, FP8StorageExperts):
+                    self._fp8_layer_count += 1
+                    for name in module._expert_param_names:
+                        self._fp8_param_count += getattr(module, f'_fp8_{name}').numel()
             fp8_compress_all(model)
 
     def on_pre_optimizer_step(self, args, state, control, **kwargs):
@@ -758,6 +783,35 @@ class FP8StorageCallback(TrainerCallback):
                 fp8_compress_all(model)
             if self._fp8_gradients:
                 clear_fp8_grad_accumulators(model)
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        """Inject FP8-specific metrics into training logs."""
+        if logs is None or self._model is None:
+            return
+
+        # Memory savings: fp8 uses 1 byte/param vs 2 bytes/param for bf16
+        # Savings = param_count * (2 - 1) for weights + (2 - 1) for gradients
+        weight_savings = self._fp8_param_count  # 1 byte saved per param
+        grad_savings = self._fp8_param_count if self._fp8_gradients else 0
+        total_savings_mb = (weight_savings + grad_savings) / (1024 * 1024)
+        logs["fp8_memory_saved_mb"] = round(total_savings_mb, 1)
+        logs["fp8_layers_converted"] = self._fp8_layer_count
+
+        # Sample weight quantization error from a few layers (not all — too expensive)
+        errors = []
+        sampled = 0
+        for module in self._model.modules():
+            if sampled >= 5:
+                break
+            if isinstance(module, FP8StorageLinear) and module._compressed:
+                bf16 = dequantize_from_fp8(module._weight_fp8, module._weight_scale)
+                re_fp8, re_scale = quantize_to_fp8(bf16)
+                reconstructed = dequantize_from_fp8(re_fp8, re_scale)
+                rel_err = (bf16 - reconstructed).abs().mean() / (bf16.abs().mean() + 1e-12)
+                errors.append(rel_err.item())
+                sampled += 1
+        if errors:
+            logs["fp8_weight_quant_error"] = round(sum(errors) / len(errors), 6)
 
     def on_save(self, args, state, control, model=None, **kwargs):
         """No-op: _save_to_state_dict handles fp8-native checkpoint format."""

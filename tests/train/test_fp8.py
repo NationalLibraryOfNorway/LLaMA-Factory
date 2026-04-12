@@ -304,3 +304,78 @@ def test_fp8_native_matmul_speedup():
         f"Native fp8 matmul was NOT faster than bf16: {speedup:.2f}x "
         f"(bf16={bf16_time*1000:.1f}ms, fp8={fp8_time*1000:.1f}ms)"
     )
+
+
+# ---------------------------------------------------------------------------
+# FP8 Metrics (on_log callback)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_fp8_callback_on_log_metrics():
+    """on_log() injects memory, layer count, and quantization error metrics."""
+    device = torch.device("cuda:0")
+    linear = nn.Linear(64, 32, bias=False).to(device, dtype=torch.bfloat16)
+    fp8_linear = FP8StorageLinear.from_linear(linear, use_native_fp8=False)
+    model = nn.ModuleList([fp8_linear])
+
+    callback = FP8StorageCallback(fp8_gradients=True, fused_optimizer=False)
+    callback.on_train_begin(args=None, state=None, control=None, model=model)
+
+    logs = {}
+    callback.on_log(args=None, state=None, control=None, logs=logs)
+
+    assert logs["fp8_layers_converted"] == 1
+    assert logs["fp8_memory_saved_mb"] > 0
+    assert "fp8_weight_quant_error" in logs
+    assert 0 <= logs["fp8_weight_quant_error"] < 0.1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_fp8_callback_on_log_no_gradients():
+    """on_log() reports less memory saved when fp8_gradients=False."""
+    device = torch.device("cuda:0")
+    linear = nn.Linear(256, 128, bias=False).to(device, dtype=torch.bfloat16)
+    fp8_linear = FP8StorageLinear.from_linear(linear, use_native_fp8=False)
+    model = nn.ModuleList([fp8_linear])
+
+    cb_with = FP8StorageCallback(fp8_gradients=True)
+    cb_with.on_train_begin(args=None, state=None, control=None, model=model)
+    logs_with = {}
+    cb_with.on_log(args=None, state=None, control=None, logs=logs_with)
+
+    cb_without = FP8StorageCallback(fp8_gradients=False)
+    cb_without.on_train_begin(args=None, state=None, control=None, model=model)
+    logs_without = {}
+    cb_without.on_log(args=None, state=None, control=None, logs=logs_without)
+
+    assert logs_with["fp8_memory_saved_mb"] > logs_without["fp8_memory_saved_mb"]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_fp8_callback_on_log_none_logs():
+    """on_log() handles None logs without raising."""
+    device = torch.device("cuda:0")
+    linear = nn.Linear(64, 32, bias=False).to(device, dtype=torch.bfloat16)
+    fp8_linear = FP8StorageLinear.from_linear(linear, use_native_fp8=False)
+    model = nn.ModuleList([fp8_linear])
+
+    callback = FP8StorageCallback(fp8_gradients=True)
+    callback.on_train_begin(args=None, state=None, control=None, model=model)
+    callback.on_log(args=None, state=None, control=None, logs=None)  # should not raise
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_fp8_callback_on_log_no_fp8_layers():
+    """on_log() reports zero metrics when model has no FP8 layers."""
+    model = nn.ModuleList([nn.Linear(64, 32)])
+
+    callback = FP8StorageCallback(fp8_gradients=True)
+    callback.on_train_begin(args=None, state=None, control=None, model=model)
+
+    logs = {}
+    callback.on_log(args=None, state=None, control=None, logs=logs)
+
+    assert logs["fp8_layers_converted"] == 0
+    assert logs["fp8_memory_saved_mb"] == 0.0
+    assert "fp8_weight_quant_error" not in logs
