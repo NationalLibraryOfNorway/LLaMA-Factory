@@ -16,7 +16,7 @@
 Native FP8 matmul kernel for Ada/Hopper GPUs.
 
 Provides _FP8MatmulFunction, a custom autograd function that performs
-forward and backward matmul using torch._scaled_mm with fp8 tensor cores.
+forward and backward matmul using scaled_mm with fp8 tensor cores.
 
 Used by FP8StorageLinear (in fp8_linear.py) when use_native_fp8=True.
 Not a standalone module -- always paired with fp8 storage lifecycle.
@@ -50,6 +50,9 @@ _E5M2_MAX = torch.finfo(torch.float8_e5m2).max     # 57344.0
 # Minimum compute capability for native fp8 matmul
 _MIN_CC_NATIVE_FP8 = (8, 9)  # Ada Lovelace
 
+# Use public F.scaled_mm (PyTorch 2.7+) with fallback to private torch._scaled_mm
+_scaled_mm = getattr(torch.nn.functional, "scaled_mm", None) or torch._scaled_mm
+
 
 def _check_native_fp8_support() -> bool:
     """Check if current GPU supports native fp8 matmul."""
@@ -78,7 +81,7 @@ def _quantize_e5m2(tensor: torch.Tensor, scale: Optional[torch.Tensor] = None):
 
 
 class _FP8MatmulFunction(Function):
-    """Custom autograd function for fp8 matmul using torch._scaled_mm.
+    """Custom autograd function for fp8 matmul using scaled_mm.
 
     Forward:  output = scaled_mm(input_e4m3, weight_e4m3^T) → bf16
     Backward: grad_input = scaled_mm(grad_output_e5m2, weight_e4m3)
@@ -104,12 +107,14 @@ class _FP8MatmulFunction(Function):
         weight_col_major = weight_fp8.t().contiguous()
 
         # scaled_mm: (M, K) @ (K, N) → (M, N)
-        output_2d = torch._scaled_mm(
+        # use_fast_accum trades ~0.1% accuracy for higher throughput on Hopper
+        output_2d = _scaled_mm(
             input_fp8,
             weight_col_major.t(),
             scale_a=input_scale,
             scale_b=weight_scale,
             out_dtype=torch.bfloat16,
+            use_fast_accum=True,
         )
 
         # Reshape back: (M, N) → (*, N)
@@ -137,7 +142,7 @@ class _FP8MatmulFunction(Function):
 
         # grad_input = grad_output @ weight  (M,N) @ (N,K) = (M,K)
         # Reuse column-major weight cached from forward (saves .t().contiguous())
-        grad_input_2d = torch._scaled_mm(
+        grad_input_2d = _scaled_mm(
             grad_fp8,
             weight_col_major.t(),
             scale_a=grad_scale,
@@ -159,7 +164,7 @@ class _FP8MatmulFunction(Function):
 
         # Pre-compute column-major input for _scaled_mm B argument
         input_col_major = input_fp8_padded.t().contiguous()
-        grad_weight = torch._scaled_mm(
+        grad_weight = _scaled_mm(
             grad_fp8_padded.t().contiguous(),
             input_col_major.t(),
             scale_a=grad_scale,

@@ -841,6 +841,16 @@ def setup_fp8_training(
     if fp8_mode == "accelerate":
         return model, callbacks, None  # Accelerate path handles everything
 
+    # Recommend efficient attention backend for FP8 training
+    attn_impl = getattr(model.config, "_attn_implementation", None)
+    if attn_impl is None or attn_impl == "eager":
+        logger.warning_rank0(
+            "FP8 training with eager attention. Consider using SDPA (flash_attn: sdpa) "
+            "or FlashAttention-2 (flash_attn: fa2) for better throughput."
+        )
+    elif attn_impl in ("sdpa", "flash_attention_2"):
+        logger.info_rank0(f"FP8 training with {attn_impl} attention — good for throughput.")
+
     skip_vision = getattr(finetuning_args, "freeze_vision_tower", True)
     use_fused = "adafactor" in getattr(training_args, "optim", "")
 

@@ -315,7 +315,8 @@ def test_fp8_native_matmul_speedup():
 def test_fp8_callback_on_log_metrics():
     """on_log() injects memory, layer count, and quantization error metrics."""
     device = torch.device("cuda:0")
-    linear = nn.Linear(64, 32, bias=False).to(device, dtype=torch.bfloat16)
+    # Use larger layer so memory savings round to > 0 MB
+    linear = nn.Linear(1024, 1024, bias=False).to(device, dtype=torch.bfloat16)
     fp8_linear = FP8StorageLinear.from_linear(linear, use_native_fp8=False)
     model = nn.ModuleList([fp8_linear])
 
@@ -379,3 +380,225 @@ def test_fp8_callback_on_log_no_fp8_layers():
     assert logs["fp8_layers_converted"] == 0
     assert logs["fp8_memory_saved_mb"] == 0.0
     assert "fp8_weight_quant_error" not in logs
+
+
+# ---------------------------------------------------------------------------
+# FP8 + Attention Backend Integration Tests
+# ---------------------------------------------------------------------------
+
+
+class _MiniAttentionBlock(nn.Module):
+    """Minimal multi-head attention block with separate Q/K/V/O projections.
+
+    Mirrors the structure of transformer attention layers (LlamaAttention, etc.)
+    to test FP8 linear replacement in a realistic attention context.
+    """
+
+    def __init__(self, hidden_size: int = 256, num_heads: int = 4):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+
+    def forward(self, x: torch.Tensor, use_sdpa: bool = False) -> torch.Tensor:
+        B, T, C = x.shape
+        q = self.q_proj(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+
+        if use_sdpa:
+            attn_out = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            # Eager attention: manual softmax + matmul
+            scale = self.head_dim ** -0.5
+            scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+            # Causal mask
+            mask = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
+            scores = scores.masked_fill(mask, float("-inf"))
+            attn_weights = torch.softmax(scores, dim=-1)
+            attn_out = torch.matmul(attn_weights, v)
+
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, C)
+        return self.o_proj(attn_out)
+
+
+class _MiniTransformer(nn.Module):
+    """Tiny transformer with attention + FFN for FP8 integration testing."""
+
+    def __init__(self, hidden_size: int = 256, num_heads: int = 4):
+        super().__init__()
+        self.attn = _MiniAttentionBlock(hidden_size, num_heads)
+        self.ffn_up = nn.Linear(hidden_size, hidden_size * 4, bias=False)
+        self.ffn_down = nn.Linear(hidden_size * 4, hidden_size, bias=False)
+        self.norm = nn.LayerNorm(hidden_size)
+
+    def forward(self, x: torch.Tensor, use_sdpa: bool = False) -> torch.Tensor:
+        x = x + self.attn(self.norm(x), use_sdpa=use_sdpa)
+        x = x + self.ffn_down(torch.nn.functional.silu(self.ffn_up(self.norm(x))))
+        return x
+
+
+from llamafactory.train.fp8_linear import convert_model_to_fp8_storage
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_fp8_with_eager_attention():
+    """FP8 linear layers work correctly with eager (manual) attention."""
+    device = torch.device("cuda:0")
+    model = _MiniTransformer(hidden_size=256, num_heads=4).to(device, dtype=torch.bfloat16)
+
+    # Convert to FP8
+    model = convert_model_to_fp8_storage(model, fp8_gradients=False, fp8_mode="storage")
+
+    # Verify projections were converted
+    assert isinstance(model.attn.q_proj, FP8StorageLinear)
+    assert isinstance(model.attn.k_proj, FP8StorageLinear)
+    assert isinstance(model.attn.v_proj, FP8StorageLinear)
+    assert isinstance(model.attn.o_proj, FP8StorageLinear)
+
+    # Forward + backward with eager attention
+    x = torch.randn(2, 32, 256, dtype=torch.bfloat16, device=device, requires_grad=True)
+    out = model(x, use_sdpa=False)
+    assert out.shape == (2, 32, 256)
+    assert out.dtype == torch.bfloat16
+
+    loss = out.sum()
+    loss.backward()
+    assert x.grad is not None
+    assert not torch.isnan(x.grad).any()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_fp8_with_sdpa_attention():
+    """FP8 linear layers work correctly with SDPA attention."""
+    device = torch.device("cuda:0")
+    model = _MiniTransformer(hidden_size=256, num_heads=4).to(device, dtype=torch.bfloat16)
+
+    # Convert to FP8
+    model = convert_model_to_fp8_storage(model, fp8_gradients=False, fp8_mode="storage")
+
+    # Forward + backward with SDPA
+    x = torch.randn(2, 32, 256, dtype=torch.bfloat16, device=device, requires_grad=True)
+    out = model(x, use_sdpa=True)
+    assert out.shape == (2, 32, 256)
+    assert out.dtype == torch.bfloat16
+
+    loss = out.sum()
+    loss.backward()
+    assert x.grad is not None
+    assert not torch.isnan(x.grad).any()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_fp8_attention_output_consistency():
+    """FP8 eager and SDPA attention produce similar outputs (within fp8 tolerance)."""
+    device = torch.device("cuda:0")
+    torch.manual_seed(42)
+
+    # Two identical models
+    model_eager = _MiniTransformer(hidden_size=256, num_heads=4).to(device, dtype=torch.bfloat16)
+    model_sdpa = _MiniTransformer(hidden_size=256, num_heads=4).to(device, dtype=torch.bfloat16)
+    model_sdpa.load_state_dict(model_eager.state_dict())
+
+    # Convert both to FP8
+    model_eager = convert_model_to_fp8_storage(model_eager, fp8_gradients=False, fp8_mode="storage")
+    model_sdpa = convert_model_to_fp8_storage(model_sdpa, fp8_gradients=False, fp8_mode="storage")
+
+    x = torch.randn(2, 16, 256, dtype=torch.bfloat16, device=device)
+    out_eager = model_eager(x, use_sdpa=False)
+    out_sdpa = model_sdpa(x, use_sdpa=True)
+
+    # Outputs should be close (same weights, same input, different attention impl)
+    max_diff = (out_eager - out_sdpa).abs().max().item()
+    assert max_diff < 0.1, f"Eager vs SDPA output diff too large: {max_diff}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_fp8_attention_with_gradient_checkpointing():
+    """FP8 + SDPA works correctly with gradient checkpointing enabled."""
+    device = torch.device("cuda:0")
+    model = _MiniTransformer(hidden_size=256, num_heads=4).to(device, dtype=torch.bfloat16)
+    model = convert_model_to_fp8_storage(model, fp8_gradients=False, fp8_mode="storage")
+
+    # Simulate gradient checkpointing: forward under no_grad, then backward re-run
+    x = torch.randn(2, 16, 256, dtype=torch.bfloat16, device=device, requires_grad=True)
+
+    # First forward under no_grad (gradient checkpointing discards activations)
+    model.train()
+    with torch.no_grad():
+        _ = model(x, use_sdpa=True)
+
+    # Verify projections got re-compressed after no_grad forward
+    assert model.attn.q_proj._compressed is True
+
+    # Second forward with grad (backward re-run materializes weights)
+    out = model(x, use_sdpa=True)
+    loss = out.sum()
+    loss.backward()
+
+    assert x.grad is not None
+    assert not torch.isnan(x.grad).any()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _check_native_fp8_support(),
+    reason="Requires native FP8 support (sm_89+)",
+)
+def test_fp8_native_with_sdpa_attention():
+    """Native FP8 matmul path works with SDPA attention."""
+    device = torch.device("cuda:0")
+    model = _MiniTransformer(hidden_size=256, num_heads=4).to(device, dtype=torch.bfloat16)
+    model = convert_model_to_fp8_storage(model, fp8_gradients=False, fp8_mode="native")
+
+    # All projections should use native fp8
+    assert model.attn.q_proj._use_native_fp8 is True
+
+    x = torch.randn(2, 16, 256, dtype=torch.bfloat16, device=device, requires_grad=True)
+    out = model(x, use_sdpa=True)
+    assert out.shape == (2, 16, 256)
+    assert out.dtype == torch.bfloat16
+
+    loss = out.sum()
+    loss.backward()
+    assert x.grad is not None
+    assert not torch.isnan(x.grad).any()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_fp8_attention_full_training_step():
+    """Full training step: FP8 + SDPA + optimizer + callback lifecycle."""
+    device = torch.device("cuda:0")
+    model = _MiniTransformer(hidden_size=256, num_heads=4).to(device, dtype=torch.bfloat16)
+    model = convert_model_to_fp8_storage(model, fp8_gradients=True, fp8_mode="storage")
+
+    callback = FP8StorageCallback(fp8_gradients=True, fused_optimizer=False)
+    callback.on_train_begin(args=None, state=None, control=None, model=model)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+
+    for step in range(3):
+        x = torch.randn(2, 16, 256, dtype=torch.bfloat16, device=device)
+        out = model(x, use_sdpa=True)
+        loss = out.sum()
+        loss.backward()
+
+        # Pre-optimizer: materialize weights + grads
+        callback.on_pre_optimizer_step(args=None, state=None, control=None)
+
+        optimizer.step()
+        optimizer.zero_grad()
+
+        # Post-step: re-compress
+        callback.on_step_end(args=None, state=None, control=None, model=model)
+
+        # Verify model is back in compressed state
+        assert model.attn.q_proj._compressed is True
+
+    # Final output should be finite
+    x = torch.randn(2, 16, 256, dtype=torch.bfloat16, device=device)
+    with torch.no_grad():
+        out = model(x, use_sdpa=True)
+    assert torch.isfinite(out).all()
