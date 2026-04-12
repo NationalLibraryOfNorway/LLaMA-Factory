@@ -100,11 +100,13 @@ class _FP8MatmulFunction(Function):
         # Quantize input to e4m3
         input_fp8, input_scale = _quantize_e4m3(input_2d)
 
+        # Pre-compute column-major weight for backward (reused for both grad matmuls)
+        weight_col_major = weight_fp8.t().contiguous()
+
         # scaled_mm: (M, K) @ (K, N) → (M, N)
-        # B must be column-major for cuBLASLt: use .t() without .contiguous()
         output_2d = torch._scaled_mm(
             input_fp8,
-            weight_fp8.t(),
+            weight_col_major.t(),
             scale_a=input_scale,
             scale_b=weight_scale,
             out_dtype=torch.bfloat16,
@@ -115,7 +117,8 @@ class _FP8MatmulFunction(Function):
         output = output_2d.reshape(*orig_shape[:-1], out_features)
 
         # Save fp8 tensors for backward (1 byte each, not bf16)
-        ctx.save_for_backward(input_fp8, input_scale, weight_fp8, weight_scale)
+        # Cache column-major weight to avoid recomputing in backward
+        ctx.save_for_backward(input_fp8, input_scale, weight_fp8, weight_scale, weight_col_major)
         ctx.has_bias = bias is not None
         ctx.orig_shape = orig_shape
         ctx.module = module
@@ -127,16 +130,16 @@ class _FP8MatmulFunction(Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        input_fp8, input_scale, weight_fp8, weight_scale = ctx.saved_tensors
+        input_fp8, input_scale, weight_fp8, weight_scale, weight_col_major = ctx.saved_tensors
 
         grad_2d = grad_output.reshape(-1, grad_output.shape[-1])
         grad_fp8, grad_scale = _quantize_e5m2(grad_2d)
 
         # grad_input = grad_output @ weight  (M,N) @ (N,K) = (M,K)
-        # B must be column-major: .t().contiguous().t() makes (N,K) col-major
+        # Reuse column-major weight cached from forward (saves .t().contiguous())
         grad_input_2d = torch._scaled_mm(
             grad_fp8,
-            weight_fp8.t().contiguous().t(),
+            weight_col_major.t(),
             scale_a=grad_scale,
             scale_b=weight_scale,
             out_dtype=torch.bfloat16,
@@ -154,10 +157,11 @@ class _FP8MatmulFunction(Function):
             grad_fp8_padded = grad_fp8
             input_fp8_padded = input_fp8
 
-        # B must be column-major: .t().contiguous().t() makes (M,K) col-major
+        # Pre-compute column-major input for _scaled_mm B argument
+        input_col_major = input_fp8_padded.t().contiguous()
         grad_weight = torch._scaled_mm(
             grad_fp8_padded.t().contiguous(),
-            input_fp8_padded.t().contiguous().t(),
+            input_col_major.t(),
             scale_a=grad_scale,
             scale_b=input_scale,
             out_dtype=torch.bfloat16,
